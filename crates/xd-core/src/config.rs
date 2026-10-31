@@ -34,7 +34,7 @@ pub struct Settings {
     pub high_stream: bool,
     /// 拉流时清空 http_proxy 等环境变量（ffmpeg 会把裸 TCP 也塞进代理）
     pub no_proxy: bool,
-    /// 给 ffmpeg 加 `-tls_verify 0`：小度 rtmps 证书已过期，官方客户端也不校验
+    /// 默认关闭；仅对已确认的证书兼容问题临时使用 `-tls_verify 0`。
     pub insecure_tls: bool,
     /// RTSP 走硬件解码（`-hwaccel auto`）
     pub hwaccel: bool,
@@ -476,7 +476,7 @@ reconnect = true       # 断流自动重连
 low_latency = true     # 低延迟参数（关掉缓冲）
 high_stream = true     # 默认使用主码流
 no_proxy = true        # 拉流时清空 http_proxy 等变量（ffmpeg 会把 RTMP/RTSP 也塞进代理）
-insecure_tls = false   # 加 -tls_verify 0；小度 rtmps 证书已过期，拉它必须开
+insecure_tls = false   # 默认关闭；仅对已确认的证书兼容问题临时使用 -tls_verify 0
 hwaccel = true         # RTSP 硬件解码（4K HEVC 软解很吃 CPU）
 cache_enabled = false  # 启动即开始滚动缓存（切片落盘，只留最近 N 分钟）
 cache_minutes = 30     # 缓存保留时长（分钟）

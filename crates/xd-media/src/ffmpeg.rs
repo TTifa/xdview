@@ -10,9 +10,9 @@ use std::time::{Duration, Instant};
 /// * `no_proxy`：ffmpeg 8 会读取 `http_proxy` 等环境变量，连裸 TCP（RTMP/RTSP）也会被塞进
 ///   HTTP 代理。实测本机代理把 `rtmps://…:1935` 导到 `127.0.0.1:3743` 后 TLS 必失败。
 ///   LAN 摄像头更不该走代理，所以默认清空这些变量。
-/// * `insecure_tls`：小度 `play.acmpy.xdrtc.com` 的证书 `CN=*.xdrtc.com` 已于
-///   **2025-12-02 过期**（官方客户端不校验证书，所以照常播放），而 ffmpeg 的 gnutls
-///   后端会直接握手失败。需要 `-tls_verify 0` 才能拉流。
+/// * `insecure_tls`：默认关闭。2026-10-31 曾观测到小度 RTMPS 端点证书过期，
+///   当时使用的 ffmpeg/GnuTLS 构建握手失败；该历史现象不代表当前证书状态或所有构建。
+///   排查应先确认当前证书与工具版本，仅对已确认的兼容问题临时使用 `-tls_verify 0`。
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub struct NetOptions {
     pub no_proxy: bool,
