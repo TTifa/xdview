@@ -1,0 +1,9 @@
+[package]
+name = "xd-core"
+description = "设备模型、配置解析、ONVIF 云台控制、小度式 RTC 寻址（零外部依赖）"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+
+[dependencies]

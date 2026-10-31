@@ -1,0 +1,6 @@
+# 统一换行：文本入库一律 LF，Windows 脚本保持 CRLF
+* text=auto eol=lf
+*.bat text eol=crlf
+*.ps1 text eol=crlf
+# 二进制不入库的样本（.gitignore 已排除，双保险）
+*.apk binary

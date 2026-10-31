@@ -1,0 +1,51 @@
+# 构建、编辑器与本地工作记录
+/target/
+/.analysis/
+/.probe/
+/.workbuddy/
+/.vs/
+/.codex/
+/.agents/
+
+# 真实配置（仅保留公开样例）
+config.toml
+config.*.toml
+!config.example.toml
+devices_export*.toml
+.env
+.env.*
+!.env.example
+
+# 画面、缓存、录制与导出
+snapshots/
+recordings/
+cache/
+exports/
+/generated-images/
+*.bmp
+*.png
+*.jpg
+*.jpeg
+*.mp4
+*.mkv
+*.ts
+
+# 原始研究资料、审查附件与研究工具，仅存本地
+/docs/local/
+/docs/reviews/
+/tools/re/
+/tools/fetch_stream_url.ps1
+*.apk
+*.dex
+*.so
+
+# 日志、私钥与临时文件
+*.log
+*.pem
+*.key
+*.p12
+*.pfx
+__pycache__/
+*.pyc
+*.tmp
+*.bak

@@ -1,0 +1,85 @@
+# xdview 配置示例 —— 复制为 config.toml 后按实际设备修改
+#
+# 注意：config.toml 里有明文密码，已加入 .gitignore，不要提交。
+
+[settings]
+data_dir = ""      # 空值使用系统用户数据目录；可设绝对路径或相对配置文件的目录
+ffmpeg = "ffmpeg"   # ffmpeg 可执行文件；不在 PATH 里就写全路径，例如 "C:\\ffmpeg\\bin\\ffmpeg.exe"
+max_width = 1280    # 解码后最大宽度（等比缩放，偶数对齐）；0 = 保持原始分辨率
+reconnect = true    # 断流自动重连（指数退避，最长 8s）
+low_latency = true  # 关闭 ffmpeg 内部缓冲，降低延迟
+high_stream = true  # 默认使用主码流
+no_proxy = true     # 拉流时清空 http_proxy 等变量（ffmpeg 会把裸 TCP 也塞进代理）
+insecure_tls = false # 加 -tls_verify 0。小度 rtmps 证书已于 2025-12-02 过期，拉它必须置 true
+hwaccel = true      # RTSP 加 -hwaccel auto；某台相机硬解花屏/失败时置 false
+cache_enabled = false # 启动即开始滚动缓存（实时流切片落盘，只留最近 N 分钟）
+cache_minutes = 30  # 缓存保留时长（分钟），更早的自动删
+cache_segment_secs = 60 # 每片时长（秒），导出粒度就是它。下限 5（ffmpeg 文件名 1 秒粒度）
+
+# ---------------------------------------------------------------- 摄像机
+
+[[camera]]
+id = "door"
+name = "门口"
+# 海康：/Streaming/Channels/101 主码流，102 子码流
+url = "rtsp://admin:password@192.168.1.10:554/Streaming/Channels/101"
+sub_url = "rtsp://admin:password@192.168.1.10:554/Streaming/Channels/102"
+onvif = "http://192.168.1.10"   # 只写主机即可，程序自动拼 /onvif/ptz_service
+username = "admin"
+password = "password"
+caps = "ptz,zoom,snapshot,recording"
+
+[[camera]]
+id = "room"
+name = "客厅"
+# 大华：rtsp://user:pass@ip:554/cam/realmonitor?channel=1&subtype=0
+url = "rtsp://admin:password@192.168.1.11:554/cam/realmonitor?channel=1&subtype=0"
+onvif = "http://192.168.1.11"
+username = "admin"
+password = "password"
+caps = "ptz,zoom,snapshot,recording"
+
+[[camera]]
+id = "yard"
+name = "院子（只读）"
+# 通用 RTSP / SRT / HLS 均可，ffmpeg 认什么就吃什么
+url = "rtsp://192.168.1.12:8554/live"
+caps = "snapshot,recording"
+
+# ---------------------------------------------------------------- TP-Link（实测可用）
+
+[[camera]]
+id = "tapo"
+name = "TP-Link 阳台"
+# Tapo 消费级（C200/C210/C220/C310/C320WS…）：
+#   1. App 里「设备设置 → 高级设置 → 摄像机账户」建一个独立账号（6~32 位）
+#   2. 地址固定为 /stream1（高清）与 /stream2（流畅），端口 554
+#   3. ONVIF 端口是 **2020**，不是 80；且不一定响应 WS-Discovery，扫不到就手填
+# 这里的账号密码可以只写在下面两个字段，程序会自动补进 URL（含百分号编码）
+url = "rtsp://192.168.1.50:554/stream1"
+sub_url = "rtsp://192.168.1.50:554/stream2"
+onvif = "http://192.168.1.50:2020"
+username = "tapo_user"
+password = "tapo_pass"
+caps = "ptz,zoom,snapshot,recording"
+# 方向键与实际相反时打开（设备开了镜像/反向，或吊装）。先用
+#   cargo run -p xd-core --example ptz -- <base> <user> <pass> verify
+# 看角度往哪边走，再决定翻哪个轴
+invert_pan = false
+invert_tilt = false
+
+[[camera]]
+id = "vigi"
+name = "TP-Link VIGI 车库"
+# VIGI 商用线（C230/C340/C540…）：
+#   1. Web UI「设置 → 网络设置 → 高级 → ONVIF」要先打开
+#   2. 摘要认证算法若是 SHA-256，请改成 MD5（本程序只实现 MD5 Digest）
+#   3. RTSP 同样是 /stream1 与 /stream2
+url = "rtsp://192.168.1.51:554/stream1"
+sub_url = "rtsp://192.168.1.51:554/stream2"
+onvif = "http://192.168.1.51"
+username = "admin"
+password = "vigi_pass"
+caps = "ptz,zoom,snapshot,recording"
+invert_pan = false
+invert_tilt = false

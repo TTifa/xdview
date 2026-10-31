@@ -1,0 +1,10 @@
+[package]
+name = "xd-media"
+description = "ffmpeg 拉流/解码管线、帧缓冲、录像（仅标准库）"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+
+[dependencies]
+xd-core = { path = "../xd-core" }

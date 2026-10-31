@@ -1,0 +1,23 @@
+[package]
+name = "xdview"
+description = "小度智能摄像机式 PC 实时视频客户端（egui + ffmpeg）"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+
+[[bin]]
+name = "xdview"
+path = "src/main.rs"
+
+[dependencies]
+xd-core = { path = "../xd-core" }
+xd-media = { path = "../xd-media" }
+
+# 只保留 glow 后端 + 内置字体：不引入 wgpu，编译更快、老显卡兼容更好
+# 版本钉死 0.31：0.32+ 起 `eframe::App` 的 `update(ctx, frame)` 被改成 `ui(ui, frame)`，
+# Panel 的 default_width/default_height 也调整过，升级需要改 UI 代码。
+eframe = { version = "=0.31.1", default-features = false, features = [
+    "default_fonts",
+    "glow",
+] }
