@@ -88,6 +88,65 @@ pub struct WindowGeom {
     pub mini: Option<GeomRect>,
 }
 
+/// 将逻辑坐标换算为物理坐标；完全离屏时返回 None，保留当前位置。
+pub fn visible_position(rect: GeomRect, pixels_per_point: f32) -> Option<(f32, f32)> {
+    visible_position_with(rect, pixels_per_point, monitor_intersects)
+}
+
+fn visible_position_with(
+    rect: GeomRect,
+    pixels_per_point: f32,
+    intersects: impl FnOnce([i32; 4]) -> bool,
+) -> Option<(f32, f32)> {
+    if !pixels_per_point.is_finite() || pixels_per_point <= 0.0 {
+        return None;
+    }
+    let scale = f64::from(pixels_per_point);
+    let physical = |v: i64| {
+        (v as f64 * scale)
+            .round()
+            .clamp(i32::MIN as f64, i32::MAX as f64) as i32
+    };
+    let x = i64::from(rect.x);
+    let y = i64::from(rect.y);
+    let bounds = [
+        physical(x),
+        physical(y),
+        physical(x + i64::from(rect.w)),
+        physical(y + i64::from(rect.h)),
+    ];
+    intersects(bounds).then_some((rect.x as f32, rect.y as f32))
+}
+
+#[cfg(windows)]
+fn monitor_intersects(bounds: [i32; 4]) -> bool {
+    #[repr(C)]
+    struct Rect {
+        left: i32,
+        top: i32,
+        right: i32,
+        bottom: i32,
+    }
+    #[link(name = "user32")]
+    extern "system" {
+        fn MonitorFromRect(rect: *const Rect, flags: u32) -> *mut std::ffi::c_void;
+    }
+    let rect = Rect {
+        left: bounds[0],
+        top: bounds[1],
+        right: bounds[2],
+        bottom: bounds[3],
+    };
+    // MONITOR_DEFAULTTONULL：完全不相交时返回空，负坐标本身不代表离屏。
+    unsafe { !MonitorFromRect(&rect, 0).is_null() }
+}
+
+#[cfg(not(windows))]
+fn monitor_intersects(_bounds: [i32; 4]) -> bool {
+    // 非 Windows 平台暂无法查询显示器，保留原有位置恢复行为。
+    true
+}
+
 impl WindowGeom {
     const FILE: &'static str = "window_geom.toml";
 
@@ -220,6 +279,38 @@ fn safe_component(value: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn remembered_position_is_checked_in_physical_pixels() {
+        let rect = GeomRect {
+            x: -1920,
+            y: -100,
+            w: 800,
+            h: 600,
+        };
+        let displays = |b: [i32; 4]| {
+            // 两块屏幕：左侧副屏和主屏，边界接触不算相交。
+            [[-2880, -300, 0, 1320], [0, 0, 1920, 1080]]
+                .iter()
+                .any(|m| b[0] < m[2] && b[2] > m[0] && b[1] < m[3] && b[3] > m[1])
+        };
+        assert_eq!(
+            visible_position_with(rect, 1.5, displays),
+            Some((-1920.0, -100.0))
+        );
+        assert_eq!(
+            visible_position_with(rect, 1.5, |b| b[2] > 0 && b[3] > 0),
+            None
+        );
+        assert_eq!(visible_position_with(rect, f32::NAN, |_| true), None);
+        let extreme = GeomRect {
+            x: i32::MAX,
+            y: i32::MIN,
+            w: u32::MAX,
+            h: u32::MAX,
+        };
+        assert!(visible_position_with(extreme, 2.0, |_| false).is_none());
+    }
 
     fn absolute_base() -> PathBuf {
         std::env::temp_dir().join("xdview-path-tests")

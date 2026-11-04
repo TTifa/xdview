@@ -266,13 +266,10 @@ fn main() -> eframe::Result {
     } else {
         [1100.0, 700.0]
     };
-    let mut vb = eframe::egui::ViewportBuilder::default()
+    let vb = eframe::egui::ViewportBuilder::default()
         .with_inner_size([w, h])
         .with_min_inner_size(min_size)
         .with_title("xdview — 智能摄像机");
-    if let Some(r) = initial {
-        vb = vb.with_position([r.x as f32, r.y as f32]);
-    }
     let options = eframe::NativeOptions {
         viewport: vb,
         ..Default::default()

@@ -34,11 +34,11 @@ const INFO: egui::Color32 = egui::Color32::from_rgb(92, 168, 232);
 const MSG: egui::Color32 = egui::Color32::from_rgb(183, 190, 203);
 const ACTIVE_BG: egui::Color32 = egui::Color32::from_rgb(19, 27, 24);
 
-/// 专注态右上悬浮按钮区宽度；顶部拖动条与「拖动起点排除区」共用。
+/// 悬浮按钮和拖窗排除区共用的宽度。
 const OVERLAY_BUTTONS_W: f32 = 230.0;
 
 /// 界面形态：普通三栏 / 专注（只看视频）/ 小窗（专注 + 无边框置顶）。
-/// 用枚举表达，避免三个 bool 组合出不可达状态；全屏是正交的视口状态，不在这里。
+/// 全屏由视口单独管理。
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum ViewMode {
     Normal,
@@ -55,7 +55,6 @@ impl ViewMode {
         matches!(self, Self::Mini)
     }
 
-    /// 纯状态转换，供单测覆盖完整序列，避免转换规则散落在各处绘制代码里。
     fn after_enter_focus(self) -> Self {
         if self == Self::Normal {
             Self::Focus
@@ -77,15 +76,52 @@ impl ViewMode {
     }
 }
 
-/// 几何槽位：切换形态时只记「正在离开」的那一槽。
+/// 窗口几何槽位。
 #[derive(Debug, Clone, Copy)]
 enum GeomSlot {
     Win,
     Mini,
 }
 
-/// 全屏以视口真值为准，不存本地镜像：视口命令异步生效，本地 bool 与镜像
-/// 每帧互相覆盖会让 Esc 卡在全屏。退出路径始终无条件下发 Fullscreen(false)。
+/// 只记录正常状态；窗口最大化或最小化后保留最近的正常几何。
+fn remember_geom(geom: &mut WindowGeom, slot: GeomSlot, viewport: &egui::ViewportInfo) {
+    if viewport.fullscreen.unwrap_or(false)
+        || viewport.minimized == Some(true)
+        || viewport.maximized == Some(true)
+    {
+        return;
+    }
+    let Some(inner) = viewport.inner_rect else {
+        return;
+    };
+    let previous = match slot {
+        GeomSlot::Win => geom.win,
+        GeomSlot::Mini => geom.mini,
+    };
+    let Some(pos) = viewport
+        .outer_rect
+        .map(|r| r.min)
+        .or_else(|| previous.map(|r| egui::pos2(r.x as f32, r.y as f32)))
+    else {
+        return;
+    };
+    let size = inner.size();
+    if !size.x.is_finite() || !size.y.is_finite() || !pos.x.is_finite() || !pos.y.is_finite() {
+        return;
+    }
+    let rect = GeomRect {
+        x: pos.x.round() as i32,
+        y: pos.y.round() as i32,
+        w: size.x.round().max(1.0) as u32,
+        h: size.y.round().max(1.0) as u32,
+    };
+    match slot {
+        GeomSlot::Win => geom.win = Some(rect),
+        GeomSlot::Mini => geom.mini = Some(rect),
+    }
+}
+
+/// 视口命令异步生效，全屏状态以视口为准。
 fn is_fullscreen(ctx: &egui::Context) -> bool {
     ctx.input(|i| i.viewport().fullscreen.unwrap_or(false))
 }
@@ -101,8 +137,7 @@ pub(crate) fn mini_default_size(fw: f32, fh: f32) -> (f32, f32) {
     ((h * fw / fh).round().clamp(320.0, 1920.0), h)
 }
 
-/// 普通态恢复目标：有记忆就用记忆值；没有记忆也必须给出默认尺寸，
-/// 但**不乱动位置**（此时窗口停在用户当前放的地方，交给系统摆放即可）。
+/// 无记忆时使用默认尺寸，位置由系统决定。
 fn restore_target(win: Option<GeomRect>) -> (egui::Vec2, Option<egui::Pos2>) {
     match win {
         Some(r) => (
@@ -267,6 +302,8 @@ pub struct XdView {
     geom: WindowGeom,
     /// 退出专注后下一帧补发一次恢复命令（winit 的装饰/尺寸切换异步生效）
     pending_restore: Option<(egui::Vec2, Option<egui::Pos2>)>,
+    /// 首帧取得 DPI 后再校验并恢复启动位置。
+    initial_position_pending: bool,
     /// `on_exit` 没有 Context 参数，留一份句柄读取最后一帧视口几何
     egui_ctx: egui::Context,
     /// 「添加设备」弹窗（手填 ONVIF 地址；小度/TP-Link 不支持 WS-Discovery，这是正路）
@@ -368,6 +405,7 @@ impl XdView {
             hover_until: None,
             geom,
             pending_restore: None,
+            initial_position_pending: true,
             egui_ctx: cc.egui_ctx.clone(),
             add_open: false,
             add_name: String::new(),
@@ -1615,64 +1653,22 @@ impl XdView {
 
     // ---- 专注模式（只看视频）/ 小窗 / 全屏 ----
 
-    /// 把当前视口几何记进指定槽位。只在「离开某个形态」和退出时调用：
-    /// 切换当帧读到的仍是旧窗口尺寸，正好是离开槽位该记的值，
-    /// 因此不需要每帧轮询，也不需要时间窗猜测命令何时生效。
     fn snapshot_geom(&mut self, ctx: &egui::Context, slot: GeomSlot) {
-        let (fullscreen, minimized, maximized, outer, inner) = ctx.input(|i| {
-            let v = i.viewport();
-            (
-                v.fullscreen,
-                v.minimized,
-                v.maximized,
-                v.outer_rect,
-                v.inner_rect,
-            )
-        });
-        // 全屏 / 最大化 / 最小化时的尺寸都不是用户想恢复的窗口几何
-        if fullscreen.unwrap_or(false) || minimized == Some(true) || maximized == Some(true) {
-            return;
-        }
-        let Some(inner) = inner else {
-            return; // 首帧或视口信息缺失时不写兜底值
-        };
-        // 外框位置缺失时沿用该槽上次的位置、只更新尺寸；拿客户区左上角当外框位置
-        // 会让窗口每次启动都偏移一个标题栏高度。
-        let previous = match slot {
-            GeomSlot::Win => self.geom.win,
-            GeomSlot::Mini => self.geom.mini,
-        };
-        let Some(pos) = outer
-            .map(|r| r.min)
-            .or_else(|| previous.map(|r| egui::pos2(r.x as f32, r.y as f32)))
-        else {
-            return;
-        };
-        let size = inner.size();
-        if !size.x.is_finite() || !size.y.is_finite() || !pos.x.is_finite() || !pos.y.is_finite() {
-            return;
-        }
-        let rect = GeomRect {
-            x: pos.x.round() as i32,
-            y: pos.y.round() as i32,
-            w: size.x.round().max(1.0) as u32,
-            h: size.y.round().max(1.0) as u32,
-        };
-        match slot {
-            GeomSlot::Win => self.geom.win = Some(rect),
-            GeomSlot::Mini => self.geom.mini = Some(rect),
-        }
+        ctx.input(|i| remember_geom(&mut self.geom, slot, i.viewport()));
     }
 
-    /// `snapshot_win=true` 表示用户从普通态主动进入，此刻视口仍是主窗口几何，可以记 win 槽；
-    /// 启动即进模式（`--focus`/`--mini`）的视口是 builder 尺寸，记了会污染主窗口记忆。
+    fn safe_position(&self, ctx: &egui::Context, rect: GeomRect) -> Option<egui::Pos2> {
+        crate::storage::visible_position(rect, ctx.pixels_per_point())
+            .map(|(x, y)| egui::pos2(x, y))
+    }
+
+    /// 启动即进专注模式时不记录 builder 尺寸，以免污染主窗口记忆。
     fn enter_focus(&mut self, ctx: &egui::Context, snapshot_win: bool) {
         if !self.view_mode.is_focus() {
             if snapshot_win {
                 self.snapshot_geom(ctx, GeomSlot::Win);
             }
             self.view_mode = self.view_mode.after_enter_focus();
-            // 专注态只看视频，已打开的弹窗先收掉，别浮在画面上
             self.ie_open = false;
             self.add_open = false;
             self.add_error.clear();
@@ -1692,10 +1688,8 @@ impl XdView {
         }
     }
 
-    /// 退出专注模式：先关全屏，再收小窗，最后恢复普通态最小尺寸。
-    /// 命令顺序固定，避免 mini+全屏组合下 InnerSize 在全屏态被忽略。
+    /// 先退出全屏，再恢复窗口属性与几何，避免全屏时忽略尺寸命令。
     fn exit_focus(&mut self, ctx: &egui::Context) {
-        // 无论视口是否认为在全屏，都下发一次关闭，避免状态不同步时卡在全屏
         ctx.send_viewport_cmd(egui::ViewportCommand::Fullscreen(false));
         if self.view_mode.is_mini() {
             self.snapshot_geom(ctx, GeomSlot::Mini);
@@ -1705,21 +1699,17 @@ impl XdView {
             ));
         }
         self.view_mode = self.view_mode.after_exit_focus();
-        // 先放宽最小尺寸，再恢复几何：MinInnerSize 放最后会把窗口撑大并改变位置。
+        // 先设置最小尺寸，再恢复几何，避免窗口撑大后位置改变。
         ctx.send_viewport_cmd(egui::ViewportCommand::MinInnerSize(egui::vec2(
             1100.0, 700.0,
         )));
-        // 无论是否小窗态都恢复主窗口尺寸；win 槽未记忆时用默认 1440×900。
         self.restore_win_geometry(ctx);
     }
 
     /// 小窗态：无边框 + 置顶。进入时按视频比例给默认尺寸（可记住自定义尺寸）。
     fn enter_mini(&mut self, ctx: &egui::Context) {
-        // 调用方必已在专注态（悬浮按钮）或刚由 start_focus_mode 置为专注态，
-        // 这里固定传 false：win 槽只由「用户从普通态主动进入」与 on_exit 维护。
+        // 专注态或启动小窗时的尺寸不代表主窗口几何。
         self.enter_focus(ctx, false);
-        // win 槽只由 enter_focus（用户主动离开普通态）和 on_exit 维护，这里不再记：
-        // 专注态缩窗后或 --mini 启动时视口都不是主窗口几何，记了会污染记忆。
         // 全屏态必须先退出全屏，否则 InnerSize 被 winit 忽略、窗口仍是全屏。
         if is_fullscreen(ctx) {
             ctx.send_viewport_cmd(egui::ViewportCommand::Fullscreen(false));
@@ -1731,10 +1721,10 @@ impl XdView {
         ));
         let (w, h) = self.mini_size();
         ctx.send_viewport_cmd(egui::ViewportCommand::InnerSize(egui::vec2(w, h)));
-        if let Some(r) = self.geom.mini {
-            ctx.send_viewport_cmd(egui::ViewportCommand::OuterPosition(egui::pos2(
-                r.x as f32, r.y as f32,
-            )));
+        if !self.initial_position_pending {
+            if let Some(pos) = self.geom.mini.and_then(|r| self.safe_position(ctx, r)) {
+                ctx.send_viewport_cmd(egui::ViewportCommand::OuterPosition(pos));
+            }
         }
         self.hover_until = Some(Instant::now() + Duration::from_secs(5));
     }
@@ -1753,7 +1743,8 @@ impl XdView {
     /// 恢复普通态几何：即便 win 槽未记忆也给出默认尺寸；命令按「尺寸 → 位置」发，
     /// 并登记下一帧补发一次（winit 处理 Decorations / MinInnerSize 时会异步覆盖结果）。
     fn restore_win_geometry(&mut self, ctx: &egui::Context) {
-        let (size, pos) = restore_target(self.geom.win);
+        let (size, _) = restore_target(self.geom.win);
+        let pos = self.geom.win.and_then(|r| self.safe_position(ctx, r));
         ctx.send_viewport_cmd(egui::ViewportCommand::InnerSize(size));
         if let Some(p) = pos {
             ctx.send_viewport_cmd(egui::ViewportCommand::OuterPosition(p));
@@ -1769,10 +1760,7 @@ impl XdView {
         }
     }
 
-    /// 切换全屏。真机复现：无边框 + 置顶的小窗直接切 Borderless 全屏时，
-    /// winit 不一定产生尺寸事件，而 egui-winit 每帧读 `window.inner_size()`，
-    /// 于是 egui/glow 仍按小窗尺寸绘制 → 满屏黑、只剩左上角一小块。
-    /// 因此进全屏前先恢复标准窗口属性，并显式把客户区设到显示器尺寸。
+    /// 小窗直接全屏可能不触发尺寸事件；先恢复窗口属性并设置显示器尺寸。
     fn toggle_fullscreen(&mut self, ctx: &egui::Context) {
         if is_fullscreen(ctx) {
             ctx.send_viewport_cmd(egui::ViewportCommand::Fullscreen(false));
@@ -1811,7 +1799,6 @@ impl XdView {
         mini_default_size(fw, fh)
     }
 
-    /// 悬浮按钮（关联函数，便于在布局闭包里调用）。
     fn overlay_button(ui: &mut egui::Ui, text: &str, active: bool) -> egui::Response {
         ui.add(
             egui::Button::new(egui::RichText::new(text).size(11.0).color(if active {
@@ -1840,10 +1827,7 @@ impl XdView {
         if Instant::now() >= until {
             return;
         }
-        // 小窗态没有标题栏：顶部左侧只画一条提示条（纯绘制，**不注册 interact**）。
-        // 拖窗手势交给 draw_video 里视频 rect 的 resp 处理：
-        // 若在这里注册覆盖画面的 interact 区，它会抢占 hit-test，使 resp 的
-        // hovered()/double_clicked() 失效——真机实测滚轮缩放与双击复位失灵。
+        // 提示条只绘制，避免抢占视频的滚轮和双击事件。
         if self.view_mode.is_mini() {
             let top = egui::Rect::from_min_size(
                 video_rect.min,
@@ -1978,9 +1962,7 @@ impl XdView {
                     }
                 }
 
-                // 小窗没有标题栏：未放大时拖动整个画面即拖窗口，与是否收到帧无关。
-                // 复用视频 resp，不再另建覆盖画面的 interact 区——那会抢占 hit-test，
-                // 使 resp.hovered()/double_clicked() 失效（真机实测滚轮与双击失灵）。
+                // 小窗未放大时复用视频响应拖动窗口，包括无画面时。
                 if self.view_mode.is_mini() && self.zoom <= 1.0 {
                     if resp.hovered() {
                         ui.ctx().set_cursor_icon(egui::CursorIcon::Grab);
@@ -2991,6 +2973,20 @@ impl eframe::App for XdView {
                 self.connect_selected();
             }
         }
+        // 首帧取得 DPI 后校验位置；后续正常帧记录实际几何。
+        if self.initial_position_pending {
+            self.initial_position_pending = false;
+            let initial = if self.view_mode.is_mini() {
+                self.geom.mini
+            } else {
+                self.geom.win
+            };
+            if let Some(pos) = initial.and_then(|r| self.safe_position(ctx, r)) {
+                ctx.send_viewport_cmd(egui::ViewportCommand::OuterPosition(pos));
+            }
+        } else if self.view_mode == ViewMode::Normal && self.pending_restore.is_none() {
+            self.snapshot_geom(ctx, GeomSlot::Win);
+        }
         // winit 的装饰切换与尺寸变更是异步的：退出专注的下一帧再钉一次几何，
         // 避免真机复现的「尺寸没恢复」与「位置漂移」。
         if let Some((size, pos)) = self.pending_restore.take() {
@@ -3440,6 +3436,45 @@ fn build_visuals() -> egui::Visuals {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn normal_geometry_survives_maximize_and_minimize() {
+        let mut geom = WindowGeom::default();
+        let mut viewport = egui::ViewportInfo {
+            outer_rect: Some(egui::Rect::from_min_size(
+                egui::pos2(-300.0, 50.0),
+                egui::vec2(1300.0, 830.0),
+            )),
+            inner_rect: Some(egui::Rect::from_min_size(
+                egui::pos2(-292.0, 80.0),
+                egui::vec2(1280.0, 800.0),
+            )),
+            ..Default::default()
+        };
+        remember_geom(&mut geom, GeomSlot::Win, &viewport);
+        let normal = geom.win;
+        assert_eq!(
+            normal,
+            Some(GeomRect {
+                x: -300,
+                y: 50,
+                w: 1280,
+                h: 800
+            })
+        );
+        viewport.maximized = Some(true);
+        viewport.inner_rect = Some(egui::Rect::from_min_size(
+            egui::Pos2::ZERO,
+            egui::vec2(1920.0, 1080.0),
+        ));
+        remember_geom(&mut geom, GeomSlot::Win, &viewport);
+        assert_eq!(geom.win, normal);
+        viewport.maximized = Some(false);
+        viewport.minimized = Some(true);
+        viewport.inner_rect = None;
+        remember_geom(&mut geom, GeomSlot::Win, &viewport);
+        assert_eq!(geom.win, normal);
+    }
 
     #[test]
     fn mini_default_size_falls_back_and_limits_bad_aspect() {
