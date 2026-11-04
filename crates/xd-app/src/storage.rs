@@ -71,6 +71,100 @@ impl StoragePaths {
     }
 }
 
+/// 窗口几何（逻辑像素；位置可为负——多屏副屏在左/上方时是合法坐标）。
+/// 与含凭据和用户注释的 `config.toml` 分开存放，避免程序退出时全量覆写配置文件。
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub struct GeomRect {
+    pub x: i32,
+    pub y: i32,
+    pub w: u32,
+    pub h: u32,
+}
+
+/// 主窗口 / 小窗两槽几何；`None` 表示尚未记忆，启动时由系统摆放。
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub struct WindowGeom {
+    pub win: Option<GeomRect>,
+    pub mini: Option<GeomRect>,
+}
+
+impl WindowGeom {
+    const FILE: &'static str = "window_geom.toml";
+
+    pub fn path(root: &Path) -> PathBuf {
+        root.join(Self::FILE)
+    }
+
+    /// 文件缺失、某行损坏或槽位不完整都按「未记忆」处理，不阻止启动。
+    pub fn load(root: &Path) -> Self {
+        let Ok(text) = std::fs::read_to_string(Self::path(root)) else {
+            return Self::default();
+        };
+        let mut vals: [Option<i32>; 8] = [None; 8];
+        for line in text.lines() {
+            let Some((key, raw)) = line.split_once('=') else {
+                continue;
+            };
+            let Ok(v) = raw.trim().parse::<i32>() else {
+                continue;
+            };
+            let idx = match key.trim() {
+                "win_x" => 0,
+                "win_y" => 1,
+                "win_w" => 2,
+                "win_h" => 3,
+                "mini_x" => 4,
+                "mini_y" => 5,
+                "mini_w" => 6,
+                "mini_h" => 7,
+                _ => continue,
+            };
+            vals[idx] = Some(v);
+        }
+        // 手改 / 损坏的文件里可能有超大尺寸，统一限幅，避免建出超屏窗口
+        const MAX_SIDE: i32 = 8192;
+        let rect =
+            |x: Option<i32>, y: Option<i32>, w: Option<i32>, h: Option<i32>| match (x, y, w, h) {
+                (Some(x), Some(y), Some(w), Some(h)) if w > 0 && h > 0 => Some(GeomRect {
+                    x,
+                    y,
+                    w: w.min(MAX_SIDE) as u32,
+                    h: h.min(MAX_SIDE) as u32,
+                }),
+                _ => None,
+            };
+        Self {
+            win: rect(vals[0], vals[1], vals[2], vals[3]),
+            mini: rect(vals[4], vals[5], vals[6], vals[7]),
+        }
+    }
+
+    /// 一次写完整个小文件；失败原因交给调用方决定如何提示。
+    pub fn save(&self, root: &Path) -> Result<(), String> {
+        let mut text = String::from("# xdview 窗口几何（程序写回；删除本文件可重置）\n");
+        for (prefix, slot) in [("win", self.win), ("mini", self.mini)] {
+            if let Some(r) = slot {
+                text.push_str(&format!(
+                    "{prefix}_x = {x}\n{prefix}_y = {y}\n{prefix}_w = {w}\n{prefix}_h = {h}\n",
+                    x = r.x,
+                    y = r.y,
+                    w = r.w,
+                    h = r.h
+                ));
+            }
+        }
+        // 先写临时文件再 rename：中途被杀只会留下 .tmp，正式文件仍是上一次的完整内容。
+        // Windows 上 fs::rename 带 MOVEFILE_REPLACE_EXISTING，可覆盖已存在的目标。
+        let path = Self::path(root);
+        let tmp = path.with_extension("toml.tmp");
+        std::fs::write(&tmp, text).map_err(|e| format!("保存窗口几何失败：{e}"))?;
+        std::fs::rename(&tmp, &path).map_err(|e| {
+            let _ = std::fs::remove_file(&tmp);
+            format!("保存窗口几何失败：{e}")
+        })
+    }
+}
+
 fn configured_root(chosen: &Path, config_path: &Path, cwd: &Path) -> PathBuf {
     if chosen.is_absolute() {
         return chosen.to_path_buf();
@@ -177,6 +271,73 @@ mod tests {
     fn rejects_ambiguous_windows_paths() {
         assert!(StoragePaths::resolve("C:media", Path::new("config.toml")).is_err());
         assert!(StoragePaths::resolve(r"\media", Path::new("config.toml")).is_err());
+    }
+
+    #[test]
+    fn window_geom_roundtrip_keeps_negative_coords() {
+        let root =
+            std::env::temp_dir().join(format!("xdview-geom-roundtrip-{}", std::process::id()));
+        std::fs::create_dir_all(&root).unwrap();
+        let geom = WindowGeom {
+            win: Some(GeomRect {
+                x: -1920,
+                y: -80,
+                w: 1600,
+                h: 1000,
+            }),
+            mini: Some(GeomRect {
+                x: 300,
+                y: 200,
+                w: 427,
+                h: 240,
+            }),
+        };
+        geom.save(&root).unwrap();
+        assert_eq!(WindowGeom::load(&root), geom);
+        // 再次保存必须整体覆盖（原子 rename 生效），不能残留上一版的 mini 行
+        let shrunk = WindowGeom {
+            win: Some(GeomRect {
+                x: -267,
+                y: -133,
+                w: 1280,
+                h: 720,
+            }),
+            mini: None,
+        };
+        shrunk.save(&root).unwrap();
+        assert_eq!(WindowGeom::load(&root), shrunk);
+        assert!(!WindowGeom::path(&root).with_extension("toml.tmp").exists());
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn window_geom_tolerates_missing_and_broken_files() {
+        let root = std::env::temp_dir().join(format!("xdview-geom-broken-{}", std::process::id()));
+        std::fs::create_dir_all(&root).unwrap();
+        assert_eq!(WindowGeom::load(&root), WindowGeom::default());
+        std::fs::write(
+            WindowGeom::path(&root),
+            "win_x = -30\nwin_y = nope\nwin_w = 800\nwin_h = 600\nmini_w = 427\n",
+        )
+        .unwrap();
+        let geom = WindowGeom::load(&root);
+        assert_eq!(geom.win, None, "缺 y 的槽位应视为未记忆");
+        assert_eq!(geom.mini, None, "只有宽度的槽位应视为未记忆");
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn window_geom_load_clamps_oversize_values() {
+        let root = std::env::temp_dir().join(format!("xdview-geom-clamp-{}", std::process::id()));
+        std::fs::create_dir_all(&root).unwrap();
+        std::fs::write(
+            WindowGeom::path(&root),
+            "win_x = 10\nwin_y = 20\nwin_w = 999999\nwin_h = 600\n",
+        )
+        .unwrap();
+        let geom = WindowGeom::load(&root);
+        assert_eq!(geom.win.map(|r| (r.w, r.h)), Some((8192, 600)));
+        let _ = std::fs::remove_dir_all(&root);
     }
 
     #[test]

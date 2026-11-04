@@ -20,6 +20,8 @@ fn main() -> eframe::Result {
     let mut check_only = false;
     let mut initial_cam: Option<String> = None;
     let mut emit_stats = false;
+    let mut start_focus = false;
+    let mut start_mini = false;
 
     let mut args = std::env::args().skip(1);
     while let Some(a) = args.next() {
@@ -31,6 +33,11 @@ fn main() -> eframe::Result {
                 }
             }
             "--stats" => emit_stats = true,
+            "--focus" => start_focus = true,
+            "--mini" => {
+                start_focus = true;
+                start_mini = true;
+            }
             "--camera" => {
                 // --camera <id|序号|名称片段>
                 if let Some(v) = args.next() {
@@ -88,13 +95,17 @@ fn main() -> eframe::Result {
             }
             "-h" | "--help" => {
                 println!(
-                    "xdview [--config <path>] [--camera <id|序号|名称>] [--check] [--discover]"
+                    "xdview [--config <path>] [--camera <id|序号|名称>] [--check] [--discover] [--stats] [--focus] [--mini]"
                 );
                 println!(
                     "  --camera <id|序号|名称>       启动时直连指定摄像机（如 --camera tplink）"
                 );
                 println!(
                     "  --stats                       每 2 秒把帧率打到 stderr（便于无头验证）"
+                );
+                println!("  --focus                       启动即进专注模式（只看视频）");
+                println!(
+                    "  --mini                        启动即进小窗模式（无边框+置顶，隐含 --focus）"
                 );
                 println!("  --check                       只解析配置并打印摘要");
                 println!("  --discover                    WS-Discovery + 网段探测扫描 ONVIF 设备");
@@ -156,6 +167,14 @@ fn main() -> eframe::Result {
     }
 
     let cfg_path = resolve_config_path(&cfg_path);
+    if let Ok(text) = std::fs::read_to_string(&cfg_path) {
+        if xd_core::config::has_legacy_window_keys(&text) {
+            eprintln!(
+                "提示：配置文件里的 win_* / mini_* 已废弃（程序不会读取）；\
+                 窗口几何改存运行数据目录的 window_geom.toml，可删除这些旧键"
+            );
+        }
+    }
     let cfg = load_or_create(&cfg_path);
     let cfg = match cfg {
         Ok(c) => c,
@@ -174,6 +193,9 @@ fn main() -> eframe::Result {
     };
 
     if check_only {
+        if start_focus || start_mini {
+            eprintln!("（--focus/--mini 只对窗口模式生效，本次 --check 诊断运行已忽略）");
+        }
         println!("配置文件：{}", cfg_path.display());
         println!("运行数据目录：{}", storage.root().display());
         println!("ffmpeg：{}", cfg.settings.ffmpeg);
@@ -224,11 +246,35 @@ fn main() -> eframe::Result {
         std::process::exit(2);
     }
 
+    // 窗口几何存独立文件，不写回 config.toml（保留用户注释与外部编辑）。
+    // 位置允许负坐标：多屏副屏在左/上方时本就是负值。
+    let geom = storage::WindowGeom::load(storage.root());
+    // --mini 只看小窗槽：拿主窗口槽兜底会让首帧以 1440×900 建窗再缩小，闪一下。
+    let initial = if start_mini { geom.mini } else { geom.win };
+    let (w, h) = if start_mini {
+        initial
+            .map(|r| (r.w.clamp(320, 2000) as f32, r.h.clamp(200, 2000) as f32))
+            .unwrap_or_else(|| app::mini_default_size(0.0, 0.0))
+    } else {
+        initial
+            .map(|r| (r.w.max(400) as f32, r.h.max(300) as f32))
+            .unwrap_or((1440.0, 900.0))
+    };
+    // 小窗启动要放宽最小尺寸，否则 builder 会把 427×240 撑回 1100×700
+    let min_size = if start_mini {
+        [320.0, 200.0]
+    } else {
+        [1100.0, 700.0]
+    };
+    let mut vb = eframe::egui::ViewportBuilder::default()
+        .with_inner_size([w, h])
+        .with_min_inner_size(min_size)
+        .with_title("xdview — 智能摄像机");
+    if let Some(r) = initial {
+        vb = vb.with_position([r.x as f32, r.y as f32]);
+    }
     let options = eframe::NativeOptions {
-        viewport: eframe::egui::ViewportBuilder::default()
-            .with_inner_size([1440.0, 900.0])
-            .with_min_inner_size([1100.0, 700.0])
-            .with_title("xdview — 智能摄像机"),
+        viewport: vb,
         ..Default::default()
     };
 
@@ -236,7 +282,10 @@ fn main() -> eframe::Result {
         "xdview",
         options,
         Box::new(move |cc| {
-            let mut view = app::XdView::new(cc, cfg, cfg_path, storage);
+            let mut view = app::XdView::new(cc, cfg, cfg_path, storage, geom);
+            if start_focus {
+                view.start_focus_mode(&cc.egui_ctx, start_mini);
+            }
             if let Some(want) = &initial_cam {
                 if !view.preselect(want) {
                     eprintln!("没找到摄像机「{want}」，仍按第一路启动");

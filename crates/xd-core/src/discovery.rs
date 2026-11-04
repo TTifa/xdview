@@ -515,18 +515,69 @@ mod tests {
     }
 
     /// 起一个一次性 HTTP stub：`response` 为完整 HTTP 应答，可应答多次。
+    ///
+    /// 必须先按 `Content-Length` 收齐请求再回包。旧实现只 `read` 一次就回复并关闭：
+    /// 客户端把请求头与 SOAP 体分两次 `write_all`，TCP 分片时请求体会留在服务端
+    /// 接收缓冲，此时关闭连接触发的是 RST 而非 FIN，客户端会丢掉已收到的响应
+    /// （实测约 1/8 概率失败，并因第二条探测路径无人应答而挂满 2s 读超时）。
     fn spawn_stub(response: &'static str, times: usize) -> u16 {
         let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("bind stub");
         let port = listener.local_addr().unwrap().port();
         std::thread::spawn(move || {
             for stream in listener.incoming().take(times) {
                 let Ok(mut s) = stream else { continue };
-                let mut buf = [0u8; 4096];
-                let _ = std::io::Read::read(&mut s, &mut buf);
-                let _ = std::io::Write::write_all(&mut s, response.as_bytes());
+                let _ = s.set_read_timeout(Some(Duration::from_secs(2)));
+                if read_http_request(&mut s).is_ok() {
+                    let _ = std::io::Write::write_all(&mut s, response.as_bytes());
+                }
+                // 请求已读完，半关闭写端发 FIN，避免带未读数据关闭导致 RST
+                let _ = s.shutdown(std::net::Shutdown::Write);
             }
         });
         port
+    }
+
+    /// 按 `Content-Length` 收齐一个 HTTP 请求；不依赖单次 `read` 收齐。
+    fn read_http_request(s: &mut TcpStream) -> std::io::Result<()> {
+        let mut buf = Vec::new();
+        let mut chunk = [0u8; 4096];
+        let header_end = loop {
+            let n = std::io::Read::read(s, &mut chunk)?;
+            if n == 0 {
+                return Err(std::io::Error::new(
+                    std::io::ErrorKind::UnexpectedEof,
+                    "请求头未收齐",
+                ));
+            }
+            buf.extend_from_slice(&chunk[..n]);
+            if let Some(pos) = buf.windows(4).position(|w| w == b"\r\n\r\n") {
+                break pos + 4;
+            }
+            if buf.len() > 64 * 1024 {
+                return Err(std::io::Error::new(
+                    std::io::ErrorKind::InvalidData,
+                    "请求头过大",
+                ));
+            }
+        };
+        let headers = String::from_utf8_lossy(&buf[..header_end]);
+        let content_len = headers.lines().find_map(|line| {
+            let (key, value) = line.split_once(':')?;
+            if !key.trim().eq_ignore_ascii_case("content-length") {
+                return None;
+            }
+            value.trim().parse::<usize>().ok()
+        });
+        // 上限 1 MiB：测试桩不需要处理更大的请求，也避免畸形长度把线程挂住
+        let total = header_end.saturating_add(content_len.unwrap_or(0).min(1024 * 1024));
+        while buf.len() < total {
+            let n = std::io::Read::read(s, &mut chunk)?;
+            if n == 0 {
+                break; // 对端提前关闭也照样回包，别让客户端等满读超时
+            }
+            buf.extend_from_slice(&chunk[..n]);
+        }
+        Ok(())
     }
 
     const ONVIF_OK: &str = "HTTP/1.1 200 OK\r\nContent-Type: application/soap+xml\r\nContent-Length: 123\r\nConnection: close\r\n\r\n<S:Envelope xmlns:S=\"http://www.w3.org/2003/05/soap-envelope\"><S:Body><GetSystemDateAndTimeResponse/></S:Body></S:Envelope>";

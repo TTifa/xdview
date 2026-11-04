@@ -210,7 +210,6 @@ pub fn parse(text: &str) -> Result<AppConfig, String> {
     if let Some(v) = get(&settings_table, "cache_segment_secs").and_then(|v| v.as_int()) {
         settings.cache_segment_secs = v.clamp(5, 600) as u32;
     }
-
     let mut out_cameras = Vec::new();
     for (i, table) in cameras.iter().enumerate() {
         let url =
@@ -366,6 +365,22 @@ impl Capabilities {
     }
 }
 
+/// 旧版本把窗口几何写进 `config.toml`，这些键现已废弃（`parse` 会忽略）。
+/// 只用于启动时给一句中文迁移提示，不参与解析。
+pub fn has_legacy_window_keys(text: &str) -> bool {
+    const KEYS: [&str; 8] = [
+        "win_x", "win_y", "win_w", "win_h", "mini_x", "mini_y", "mini_w", "mini_h",
+    ];
+    text.lines().any(|line| {
+        let line = line.trim_start();
+        if line.starts_with('#') {
+            return false;
+        }
+        line.split_once('=')
+            .is_some_and(|(key, _)| KEYS.contains(&key.trim()))
+    })
+}
+
 pub fn load(path: &std::path::Path) -> Result<AppConfig, String> {
     let text = std::fs::read_to_string(path)
         .map_err(|e| format!("读取配置 {} 失败: {e}", path.display()))?;
@@ -481,7 +496,6 @@ hwaccel = true         # RTSP 硬件解码（4K HEVC 软解很吃 CPU）
 cache_enabled = false  # 启动即开始滚动缓存（切片落盘，只留最近 N 分钟）
 cache_minutes = 30     # 缓存保留时长（分钟）
 cache_segment_secs = 60 # 每个切片多长（秒）
-
 [[camera]]
 id = "door"
 name = "门口"
@@ -558,6 +572,14 @@ mod tests {
     fn escaped_values() {
         let cfg = parse("[[camera]]\nurl = \"a\\\\b\\\"c\"\n").unwrap();
         assert_eq!(cfg.cameras[0].stream_url, "a\\b\"c");
+    }
+
+    #[test]
+    fn detects_legacy_window_keys_but_ignores_comments() {
+        assert!(has_legacy_window_keys("[settings]\nwin_x = 100\n"));
+        assert!(has_legacy_window_keys("  mini_h = 240\n"));
+        assert!(!has_legacy_window_keys("[settings]\n# win_x = 100\n"));
+        assert!(!has_legacy_window_keys("[settings]\ncache_minutes = 30\n"));
     }
 
     #[test]

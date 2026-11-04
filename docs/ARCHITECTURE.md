@@ -77,11 +77,11 @@ crates/xd-media/            零依赖 · ffmpeg 管线
   examples/export_cache.rs  命令行导出缓存片段
 
 crates/xd-app/              egui 界面
-  src/main.rs               CLI 参数（--check/--discover/--onvif/--camera/--stats）
+  src/main.rs               CLI 参数（--check/--discover/--onvif/--camera/--stats/--focus/--mini）
   src/app.rs                主界面 + 生命周期（on_exit 收尾）
   src/control.rs            ONVIF 后台线程（不阻塞 UI）
   src/font.rs               中文字体加载 + TTC→TTF 抽取
-  src/storage.rs            系统用户数据目录、自定义路径与输出路径边界
+  src/storage.rs            系统用户数据目录、自定义路径与输出路径边界、窗口几何独立文件
 
 docs/                       公开文档见 docs/README.md
   local/                    原始研究报告、现场记录与 APK（仅本地，不入库）

@@ -5,7 +5,7 @@
 
 use crate::control::{Command, ControlLink, Feedback, Session, LEASE_RENEW};
 use crate::font;
-use crate::storage::StoragePaths;
+use crate::storage::{GeomRect, StoragePaths, WindowGeom};
 use eframe::egui;
 use std::collections::VecDeque;
 use std::path::PathBuf;
@@ -33,6 +33,90 @@ const BAD: egui::Color32 = egui::Color32::from_rgb(226, 96, 96);
 const INFO: egui::Color32 = egui::Color32::from_rgb(92, 168, 232);
 const MSG: egui::Color32 = egui::Color32::from_rgb(183, 190, 203);
 const ACTIVE_BG: egui::Color32 = egui::Color32::from_rgb(19, 27, 24);
+
+/// 专注态右上悬浮按钮区宽度；顶部拖动条与「拖动起点排除区」共用。
+const OVERLAY_BUTTONS_W: f32 = 230.0;
+
+/// 界面形态：普通三栏 / 专注（只看视频）/ 小窗（专注 + 无边框置顶）。
+/// 用枚举表达，避免三个 bool 组合出不可达状态；全屏是正交的视口状态，不在这里。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ViewMode {
+    Normal,
+    Focus,
+    Mini,
+}
+
+impl ViewMode {
+    fn is_focus(self) -> bool {
+        matches!(self, Self::Focus | Self::Mini)
+    }
+
+    fn is_mini(self) -> bool {
+        matches!(self, Self::Mini)
+    }
+
+    /// 纯状态转换，供单测覆盖完整序列，避免转换规则散落在各处绘制代码里。
+    fn after_enter_focus(self) -> Self {
+        if self == Self::Normal {
+            Self::Focus
+        } else {
+            self
+        }
+    }
+
+    fn after_enter_mini(self) -> Self {
+        Self::Mini
+    }
+
+    fn after_exit_mini(self) -> Self {
+        Self::Focus
+    }
+
+    fn after_exit_focus(self) -> Self {
+        Self::Normal
+    }
+}
+
+/// 几何槽位：切换形态时只记「正在离开」的那一槽。
+#[derive(Debug, Clone, Copy)]
+enum GeomSlot {
+    Win,
+    Mini,
+}
+
+/// 全屏以视口真值为准，不存本地镜像：视口命令异步生效，本地 bool 与镜像
+/// 每帧互相覆盖会让 Esc 卡在全屏。退出路径始终无条件下发 Fullscreen(false)。
+fn is_fullscreen(ctx: &egui::Context) -> bool {
+    ctx.input(|i| i.viewport().fullscreen.unwrap_or(false))
+}
+
+/// 小窗默认尺寸：按视频比例给 240 高；比例异常/缺失回退 16:9，宽度限幅避免异常窗口。
+pub(crate) fn mini_default_size(fw: f32, fh: f32) -> (f32, f32) {
+    let (fw, fh) = if fw > 0.0 && fh > 0.0 && fw.is_finite() && fh.is_finite() {
+        (fw, fh)
+    } else {
+        (16.0, 9.0)
+    };
+    let h = 240.0_f32;
+    ((h * fw / fh).round().clamp(320.0, 1920.0), h)
+}
+
+/// 普通态恢复目标：有记忆就用记忆值；没有记忆也必须给出默认尺寸，
+/// 但**不乱动位置**（此时窗口停在用户当前放的地方，交给系统摆放即可）。
+fn restore_target(win: Option<GeomRect>) -> (egui::Vec2, Option<egui::Pos2>) {
+    match win {
+        Some(r) => (
+            egui::vec2(r.w.max(400) as f32, r.h.max(300) as f32),
+            Some(egui::pos2(r.x as f32, r.y as f32)),
+        ),
+        None => (egui::vec2(1440.0, 900.0), None),
+    }
+}
+
+/// 拖动起点是否落在专注态右上悬浮按钮区：那里要留给按钮，不能触发拖窗。
+fn drag_started_on_overlay(pos: Option<egui::Pos2>, rect: egui::Rect) -> bool {
+    pos.is_some_and(|p| p.x >= rect.max.x - OVERLAY_BUTTONS_W && p.y <= rect.min.y + 28.0)
+}
 
 enum Conn {
     Idle,
@@ -175,6 +259,16 @@ pub struct XdView {
     left_w: f32,
     /// 右栏（实时统计/控制）宽度，由分界手柄拖拽驱动。
     right_w: f32,
+    /// 界面形态（普通 / 专注 / 小窗）
+    view_mode: ViewMode,
+    /// 专注模式悬浮控件的自动隐藏时刻（指针/滚轮/按键一动就续期）
+    hover_until: Option<Instant>,
+    /// 主窗口 / 小窗两槽几何，存独立文件，退出时写回
+    geom: WindowGeom,
+    /// 退出专注后下一帧补发一次恢复命令（winit 的装饰/尺寸切换异步生效）
+    pending_restore: Option<(egui::Vec2, Option<egui::Pos2>)>,
+    /// `on_exit` 没有 Context 参数，留一份句柄读取最后一帧视口几何
+    egui_ctx: egui::Context,
     /// 「添加设备」弹窗（手填 ONVIF 地址；小度/TP-Link 不支持 WS-Discovery，这是正路）
     add_open: bool,
     add_name: String,
@@ -206,6 +300,7 @@ impl XdView {
         cfg: AppConfig,
         cfg_path: PathBuf,
         storage: StoragePaths,
+        geom: WindowGeom,
     ) -> Self {
         cc.egui_ctx.set_visuals(build_visuals());
         let cjk = font::find_cjk_font();
@@ -269,6 +364,11 @@ impl XdView {
             zoom_uv_min: egui::pos2(0.0, 0.0),
             left_w: 246.0,
             right_w: 314.0,
+            view_mode: ViewMode::Normal,
+            hover_until: None,
+            geom,
+            pending_restore: None,
+            egui_ctx: cc.egui_ctx.clone(),
             add_open: false,
             add_name: String::new(),
             add_url: String::new(),
@@ -371,11 +471,13 @@ impl XdView {
             cam, size, self.stats.frames, self.stats.fps, self.stats.mb_per_s, tag
         );
         eprintln!(
-            "[dbg] screen={:?} left_w={:.1} right_w={:.1} zoom={:.2}",
+            "[dbg] screen={:?} left_w={:.1} right_w={:.1} zoom={:.2} mode={:?} fs={}",
             ctx.screen_rect(),
             self.left_w,
             self.right_w,
-            self.zoom
+            self.zoom,
+            self.view_mode,
+            is_fullscreen(ctx)
         );
     }
 
@@ -1156,6 +1258,27 @@ impl XdView {
                     chip(ui, "DVR 缓存", self.cache_running());
 
                     ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                        if ui
+                            .add(
+                                egui::Button::new(
+                                    egui::RichText::new("▣ 专注")
+                                        .size(12.0)
+                                        .strong()
+                                        .color(egui::Color32::from_rgb(138, 224, 178)),
+                                )
+                                .fill(egui::Color32::from_rgb(26, 52, 38))
+                                .stroke(egui::Stroke::new(
+                                    1.5_f32,
+                                    egui::Color32::from_rgb(92, 176, 130),
+                                ))
+                                .corner_radius(8.0_f32),
+                            )
+                            .on_hover_text("只看视频（双击画面 / Esc 退出）")
+                            .clicked()
+                        {
+                            self.enter_focus(ctx, true);
+                        }
+                        ui.add_space(10.0);
                         ui.label(
                             egui::RichText::new(self.stamp())
                                 .monospace()
@@ -1490,13 +1613,280 @@ impl XdView {
         self.zoom_uv_min = egui::pos2(0.0, 0.0);
     }
 
+    // ---- 专注模式（只看视频）/ 小窗 / 全屏 ----
+
+    /// 把当前视口几何记进指定槽位。只在「离开某个形态」和退出时调用：
+    /// 切换当帧读到的仍是旧窗口尺寸，正好是离开槽位该记的值，
+    /// 因此不需要每帧轮询，也不需要时间窗猜测命令何时生效。
+    fn snapshot_geom(&mut self, ctx: &egui::Context, slot: GeomSlot) {
+        let (fullscreen, minimized, maximized, outer, inner) = ctx.input(|i| {
+            let v = i.viewport();
+            (
+                v.fullscreen,
+                v.minimized,
+                v.maximized,
+                v.outer_rect,
+                v.inner_rect,
+            )
+        });
+        // 全屏 / 最大化 / 最小化时的尺寸都不是用户想恢复的窗口几何
+        if fullscreen.unwrap_or(false) || minimized == Some(true) || maximized == Some(true) {
+            return;
+        }
+        let Some(inner) = inner else {
+            return; // 首帧或视口信息缺失时不写兜底值
+        };
+        // 外框位置缺失时沿用该槽上次的位置、只更新尺寸；拿客户区左上角当外框位置
+        // 会让窗口每次启动都偏移一个标题栏高度。
+        let previous = match slot {
+            GeomSlot::Win => self.geom.win,
+            GeomSlot::Mini => self.geom.mini,
+        };
+        let Some(pos) = outer
+            .map(|r| r.min)
+            .or_else(|| previous.map(|r| egui::pos2(r.x as f32, r.y as f32)))
+        else {
+            return;
+        };
+        let size = inner.size();
+        if !size.x.is_finite() || !size.y.is_finite() || !pos.x.is_finite() || !pos.y.is_finite() {
+            return;
+        }
+        let rect = GeomRect {
+            x: pos.x.round() as i32,
+            y: pos.y.round() as i32,
+            w: size.x.round().max(1.0) as u32,
+            h: size.y.round().max(1.0) as u32,
+        };
+        match slot {
+            GeomSlot::Win => self.geom.win = Some(rect),
+            GeomSlot::Mini => self.geom.mini = Some(rect),
+        }
+    }
+
+    /// `snapshot_win=true` 表示用户从普通态主动进入，此刻视口仍是主窗口几何，可以记 win 槽；
+    /// 启动即进模式（`--focus`/`--mini`）的视口是 builder 尺寸，记了会污染主窗口记忆。
+    fn enter_focus(&mut self, ctx: &egui::Context, snapshot_win: bool) {
+        if !self.view_mode.is_focus() {
+            if snapshot_win {
+                self.snapshot_geom(ctx, GeomSlot::Win);
+            }
+            self.view_mode = self.view_mode.after_enter_focus();
+            // 专注态只看视频，已打开的弹窗先收掉，别浮在画面上
+            self.ie_open = false;
+            self.add_open = false;
+            self.add_error.clear();
+            // 专注态没有侧栏，允许缩成小窗；普通态三栏需要 1100×700 起步
+            ctx.send_viewport_cmd(egui::ViewportCommand::MinInnerSize(egui::vec2(
+                320.0, 200.0,
+            )));
+        }
+        self.hover_until = Some(Instant::now() + Duration::from_secs(5));
+    }
+
+    /// 启动即进专注/小窗模式（`--focus` / `--mini`）。
+    pub fn start_focus_mode(&mut self, ctx: &egui::Context, mini: bool) {
+        self.enter_focus(ctx, false);
+        if mini {
+            self.enter_mini(ctx);
+        }
+    }
+
+    /// 退出专注模式：先关全屏，再收小窗，最后恢复普通态最小尺寸。
+    /// 命令顺序固定，避免 mini+全屏组合下 InnerSize 在全屏态被忽略。
+    fn exit_focus(&mut self, ctx: &egui::Context) {
+        // 无论视口是否认为在全屏，都下发一次关闭，避免状态不同步时卡在全屏
+        ctx.send_viewport_cmd(egui::ViewportCommand::Fullscreen(false));
+        if self.view_mode.is_mini() {
+            self.snapshot_geom(ctx, GeomSlot::Mini);
+            ctx.send_viewport_cmd(egui::ViewportCommand::Decorations(true));
+            ctx.send_viewport_cmd(egui::ViewportCommand::WindowLevel(
+                egui::WindowLevel::Normal,
+            ));
+        }
+        self.view_mode = self.view_mode.after_exit_focus();
+        // 先放宽最小尺寸，再恢复几何：MinInnerSize 放最后会把窗口撑大并改变位置。
+        ctx.send_viewport_cmd(egui::ViewportCommand::MinInnerSize(egui::vec2(
+            1100.0, 700.0,
+        )));
+        // 无论是否小窗态都恢复主窗口尺寸；win 槽未记忆时用默认 1440×900。
+        self.restore_win_geometry(ctx);
+    }
+
+    /// 小窗态：无边框 + 置顶。进入时按视频比例给默认尺寸（可记住自定义尺寸）。
+    fn enter_mini(&mut self, ctx: &egui::Context) {
+        // 调用方必已在专注态（悬浮按钮）或刚由 start_focus_mode 置为专注态，
+        // 这里固定传 false：win 槽只由「用户从普通态主动进入」与 on_exit 维护。
+        self.enter_focus(ctx, false);
+        // win 槽只由 enter_focus（用户主动离开普通态）和 on_exit 维护，这里不再记：
+        // 专注态缩窗后或 --mini 启动时视口都不是主窗口几何，记了会污染记忆。
+        // 全屏态必须先退出全屏，否则 InnerSize 被 winit 忽略、窗口仍是全屏。
+        if is_fullscreen(ctx) {
+            ctx.send_viewport_cmd(egui::ViewportCommand::Fullscreen(false));
+        }
+        self.view_mode = self.view_mode.after_enter_mini();
+        ctx.send_viewport_cmd(egui::ViewportCommand::Decorations(false));
+        ctx.send_viewport_cmd(egui::ViewportCommand::WindowLevel(
+            egui::WindowLevel::AlwaysOnTop,
+        ));
+        let (w, h) = self.mini_size();
+        ctx.send_viewport_cmd(egui::ViewportCommand::InnerSize(egui::vec2(w, h)));
+        if let Some(r) = self.geom.mini {
+            ctx.send_viewport_cmd(egui::ViewportCommand::OuterPosition(egui::pos2(
+                r.x as f32, r.y as f32,
+            )));
+        }
+        self.hover_until = Some(Instant::now() + Duration::from_secs(5));
+    }
+
+    /// 退出小窗：先记小窗几何（视口此刻仍是小窗尺寸），再还原装饰与主窗口几何。
+    fn exit_mini(&mut self, ctx: &egui::Context) {
+        self.snapshot_geom(ctx, GeomSlot::Mini);
+        self.view_mode = self.view_mode.after_exit_mini();
+        ctx.send_viewport_cmd(egui::ViewportCommand::Decorations(true));
+        ctx.send_viewport_cmd(egui::ViewportCommand::WindowLevel(
+            egui::WindowLevel::Normal,
+        ));
+        self.restore_win_geometry(ctx);
+    }
+
+    /// 恢复普通态几何：即便 win 槽未记忆也给出默认尺寸；命令按「尺寸 → 位置」发，
+    /// 并登记下一帧补发一次（winit 处理 Decorations / MinInnerSize 时会异步覆盖结果）。
+    fn restore_win_geometry(&mut self, ctx: &egui::Context) {
+        let (size, pos) = restore_target(self.geom.win);
+        ctx.send_viewport_cmd(egui::ViewportCommand::InnerSize(size));
+        if let Some(p) = pos {
+            ctx.send_viewport_cmd(egui::ViewportCommand::OuterPosition(p));
+        }
+        self.pending_restore = Some((size, pos));
+    }
+
+    fn toggle_mini(&mut self, ctx: &egui::Context) {
+        if self.view_mode.is_mini() {
+            self.exit_mini(ctx);
+        } else {
+            self.enter_mini(ctx);
+        }
+    }
+
+    /// 切换全屏。真机复现：无边框 + 置顶的小窗直接切 Borderless 全屏时，
+    /// winit 不一定产生尺寸事件，而 egui-winit 每帧读 `window.inner_size()`，
+    /// 于是 egui/glow 仍按小窗尺寸绘制 → 满屏黑、只剩左上角一小块。
+    /// 因此进全屏前先恢复标准窗口属性，并显式把客户区设到显示器尺寸。
+    fn toggle_fullscreen(&mut self, ctx: &egui::Context) {
+        if is_fullscreen(ctx) {
+            ctx.send_viewport_cmd(egui::ViewportCommand::Fullscreen(false));
+            // 退出全屏后回到专注态的常规尺寸，避免停在整屏大小
+            let (size, _) = restore_target(self.geom.win);
+            ctx.send_viewport_cmd(egui::ViewportCommand::InnerSize(size));
+            return;
+        }
+        if self.view_mode.is_mini() {
+            self.snapshot_geom(ctx, GeomSlot::Mini);
+            self.view_mode = self.view_mode.after_exit_mini(); // Focus：全屏与小窗互斥
+            ctx.send_viewport_cmd(egui::ViewportCommand::Decorations(true));
+            ctx.send_viewport_cmd(egui::ViewportCommand::WindowLevel(
+                egui::WindowLevel::Normal,
+            ));
+        }
+        // 不要让退出专注遗留的恢复命令在全屏时把窗口拉回小尺寸
+        self.pending_restore = None;
+        // monitor_size 是逻辑像素（egui-winit 已按 pixels_per_point 换算），可直接给 InnerSize
+        if let Some(monitor) = ctx.input(|i| i.viewport().monitor_size) {
+            ctx.send_viewport_cmd(egui::ViewportCommand::InnerSize(monitor));
+        }
+        ctx.send_viewport_cmd(egui::ViewportCommand::Fullscreen(true));
+    }
+
+    /// 小窗尺寸：优先用记忆值；否则按视频比例给 240 高，比例异常或缺失回退 16:9 并限幅。
+    fn mini_size(&self) -> (f32, f32) {
+        if let Some(r) = self.geom.mini.filter(|r| r.w >= 320 && r.h >= 200) {
+            return (r.w.min(2000) as f32, r.h.min(2000) as f32);
+        }
+        let (fw, fh) = self
+            .frame
+            .as_ref()
+            .map(|f| (f.width as f32, f.height as f32))
+            .unwrap_or((0.0, 0.0));
+        mini_default_size(fw, fh)
+    }
+
+    /// 悬浮按钮（关联函数，便于在布局闭包里调用）。
+    fn overlay_button(ui: &mut egui::Ui, text: &str, active: bool) -> egui::Response {
+        ui.add(
+            egui::Button::new(egui::RichText::new(text).size(11.0).color(if active {
+                OK
+            } else {
+                TEXT
+            }))
+            .fill(egui::Color32::from_black_alpha(120))
+            .stroke(egui::Stroke::new(
+                1.0_f32,
+                if active {
+                    egui::Color32::from_rgb(58, 110, 84)
+                } else {
+                    BORDER
+                },
+            ))
+            .corner_radius(6.0_f32),
+        )
+    }
+
+    /// 专注模式悬浮控件：小窗态顶部拖动区 + 右上按钮行，5 秒不动自动隐藏。
+    fn draw_focus_overlay(&mut self, ui: &mut egui::Ui, video_rect: egui::Rect) {
+        let Some(until) = self.hover_until else {
+            return;
+        };
+        if Instant::now() >= until {
+            return;
+        }
+        // 小窗态没有标题栏：顶部左侧只画一条提示条（纯绘制，**不注册 interact**）。
+        // 拖窗手势交给 draw_video 里视频 rect 的 resp 处理：
+        // 若在这里注册覆盖画面的 interact 区，它会抢占 hit-test，使 resp 的
+        // hovered()/double_clicked() 失效——真机实测滚轮缩放与双击复位失灵。
+        if self.view_mode.is_mini() {
+            let top = egui::Rect::from_min_size(
+                video_rect.min,
+                egui::vec2((video_rect.width() - OVERLAY_BUTTONS_W).max(0.0), 28.0),
+            );
+            ui.painter_at(top)
+                .rect_filled(top, 0.0, egui::Color32::from_black_alpha(70));
+        }
+        let top = video_rect.min.y + 4.0;
+        let row = egui::Rect::from_min_max(
+            egui::pos2(video_rect.min.x, top),
+            egui::pos2(video_rect.max.x - 10.0, top + 22.0),
+        );
+        ui.allocate_new_ui(egui::UiBuilder::new().max_rect(row), |ui| {
+            ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                let ctx = ui.ctx().clone();
+                if Self::overlay_button(ui, "全屏", is_fullscreen(&ctx)).clicked() {
+                    self.toggle_fullscreen(&ctx);
+                }
+                if Self::overlay_button(ui, "小窗", self.view_mode.is_mini()).clicked() {
+                    self.toggle_mini(&ctx);
+                }
+                if Self::overlay_button(ui, "还原", false).clicked() {
+                    self.exit_focus(&ctx);
+                }
+                if self.zoom > 1.0 && Self::overlay_button(ui, "复位", false).clicked() {
+                    self.reset_zoom();
+                }
+            });
+        });
+    }
+
     fn draw_video(&mut self, ctx: &egui::Context) {
         egui::CentralPanel::default()
             .frame(egui::Frame::new().fill(BG))
             .show(ctx, |ui| {
                 let avail = ui.available_size();
-                let bar_h = 44.0;
-                let log_h = if self.show_log { 168.0 } else { 0.0 };
+                let bar_h = if self.view_mode.is_focus() { 0.0 } else { 44.0 };
+                let log_h = if self.show_log && !self.view_mode.is_focus() {
+                    168.0
+                } else {
+                    0.0
+                };
                 let video_h = (avail.y - bar_h - log_h).max(80.0);
                 let (rect, resp) = ui.allocate_exact_size(
                     egui::vec2(avail.x, video_h),
@@ -1579,12 +1969,31 @@ impl XdView {
                     }
                 }
 
-                // ---- 数字变焦交互：滚轮缩放、拖动平移、双击复位 ----
+                // 双击：普通模式进入专注模式（只看视频）；专注模式内双击复位变焦
+                if resp.double_clicked() {
+                    if self.view_mode.is_focus() {
+                        self.reset_zoom();
+                    } else {
+                        self.enter_focus(ctx, true);
+                    }
+                }
+
+                // 小窗没有标题栏：未放大时拖动整个画面即拖窗口，与是否收到帧无关。
+                // 复用视频 resp，不再另建覆盖画面的 interact 区——那会抢占 hit-test，
+                // 使 resp.hovered()/double_clicked() 失效（真机实测滚轮与双击失灵）。
+                if self.view_mode.is_mini() && self.zoom <= 1.0 {
+                    if resp.hovered() {
+                        ui.ctx().set_cursor_icon(egui::CursorIcon::Grab);
+                    }
+                    if resp.dragged() && !drag_started_on_overlay(resp.interact_pointer_pos(), rect)
+                    {
+                        ctx.send_viewport_cmd(egui::ViewportCommand::StartDrag);
+                    }
+                }
+
+                // ---- 数字变焦交互：滚轮缩放、拖动平移 ----
                 if let Some((fw, fh)) = self.frame.as_ref().map(|f| (f.width, f.height)) {
                     let dst = fit_rect(rect, fw, fh);
-                    if resp.double_clicked() {
-                        self.reset_zoom();
-                    }
                     let scroll = ui.input(|i| i.smooth_scroll_delta.y);
                     if resp.hovered() && scroll.abs() > 0.0 {
                         let anchor = resp
@@ -1608,8 +2017,8 @@ impl XdView {
                     }
                 }
 
-                // ---- 分栏拖拽手柄：拖动左右分界线调节三栏宽度 ----
-                {
+                // ---- 分栏拖拽手柄：拖动左右分界线调节三栏宽度（专注模式无侧栏）----
+                if !self.view_mode.is_focus() {
                     let full = ui.max_rect();
                     let hl = egui::Rect::from_min_max(
                         egui::pos2(full.min.x - 4.0, full.min.y),
@@ -1649,143 +2058,160 @@ impl XdView {
                     }
                 }
 
-                // ---- 视频下操作条 ----
-                let can_stream_switch = self
-                    .current()
-                    .and_then(|c| c.sub_stream_url.as_ref())
-                    .is_some();
-                let live = matches!(self.conn, Conn::Live { .. } | Conn::Connecting);
-                egui::Frame::new()
-                    .fill(PANEL)
-                    .stroke(egui::Stroke::new(1.0_f32, BORDER))
-                    .inner_margin(egui::Margin {
-                        left: 18,
-                        right: 18,
-                        top: 0,
-                        bottom: 0,
-                    })
-                    .show(ui, |ui| {
-                        ui.set_height(bar_h);
-                        ui.horizontal_centered(|ui| {
-                            let (_st, color) = self.status_of();
-                            let prefix = if matches!(self.conn, Conn::Live { .. }) {
-                                "实时预览"
-                            } else {
-                                "连接状态"
-                            };
-                            ui.label(egui::RichText::new(prefix).size(12.0).strong().color(color));
-                            ui.label(
-                                egui::RichText::new(format!(
-                                    " · {} · {}",
-                                    self.current().map(|c| c.name.as_str()).unwrap_or("—"),
-                                    if self.high_stream {
-                                        "主码流"
-                                    } else {
-                                        "子码流"
-                                    }
-                                ))
-                                .size(12.0)
-                                .color(DIM),
-                            );
-                            ui.with_layout(
-                                egui::Layout::right_to_left(egui::Align::Center),
-                                |ui| {
-                                    // 断开
-                                    if ui
-                                        .add_enabled(
-                                            live,
-                                            egui::Button::new(
-                                                egui::RichText::new("断开").size(12.0),
+                // ---- 视频下操作条（专注模式隐藏）----
+                if !self.view_mode.is_focus() {
+                    let can_stream_switch = self
+                        .current()
+                        .and_then(|c| c.sub_stream_url.as_ref())
+                        .is_some();
+                    let live = matches!(self.conn, Conn::Live { .. } | Conn::Connecting);
+                    egui::Frame::new()
+                        .fill(PANEL)
+                        .stroke(egui::Stroke::new(1.0_f32, BORDER))
+                        .inner_margin(egui::Margin {
+                            left: 18,
+                            right: 18,
+                            top: 0,
+                            bottom: 0,
+                        })
+                        .show(ui, |ui| {
+                            ui.set_height(bar_h);
+                            ui.horizontal_centered(|ui| {
+                                let (_st, color) = self.status_of();
+                                let prefix = if matches!(self.conn, Conn::Live { .. }) {
+                                    "实时预览"
+                                } else {
+                                    "连接状态"
+                                };
+                                ui.label(
+                                    egui::RichText::new(prefix).size(12.0).strong().color(color),
+                                );
+                                ui.label(
+                                    egui::RichText::new(format!(
+                                        " · {} · {}",
+                                        self.current().map(|c| c.name.as_str()).unwrap_or("—"),
+                                        if self.high_stream {
+                                            "主码流"
+                                        } else {
+                                            "子码流"
+                                        }
+                                    ))
+                                    .size(12.0)
+                                    .color(DIM),
+                                );
+                                ui.with_layout(
+                                    egui::Layout::right_to_left(egui::Align::Center),
+                                    |ui| {
+                                        // 断开
+                                        if ui
+                                            .add_enabled(
+                                                live,
+                                                egui::Button::new(
+                                                    egui::RichText::new("断开").size(12.0),
+                                                )
+                                                .fill(PANEL2)
+                                                .stroke(egui::Stroke::new(
+                                                    1.0_f32,
+                                                    egui::Color32::from_rgb(96, 52, 52),
+                                                ))
+                                                .corner_radius(6.0_f32),
                                             )
-                                            .fill(PANEL2)
-                                            .stroke(egui::Stroke::new(
-                                                1.0_f32,
-                                                egui::Color32::from_rgb(96, 52, 52),
-                                            ))
-                                            .corner_radius(6.0_f32),
-                                        )
-                                        .clicked()
-                                    {
-                                        self.disconnect(true);
-                                    }
-                                    if can_stream_switch {
-                                        ui.add_space(10.0);
-                                        if seg_btn(ui, "子码流", !self.high_stream).clicked() {
-                                            self.set_stream(false);
+                                            .clicked()
+                                        {
+                                            self.disconnect(true);
                                         }
-                                        if seg_btn(ui, "主码流", self.high_stream).clicked() {
-                                            self.set_stream(true);
-                                        }
-                                    }
-                                    // 解码清晰度档位（max_width 上限）
-                                    ui.add_space(10.0);
-                                    let mw_before = self.cfg.settings.max_width;
-                                    egui::ComboBox::from_id_salt("res_tier")
-                                        .selected_text(
-                                            egui::RichText::new(tier_label(mw_before)).size(11.0),
-                                        )
-                                        .width(84.0)
-                                        .show_ui(ui, |ui| {
-                                            for (name, w) in RES_TIERS {
-                                                ui.selectable_value(
-                                                    &mut self.cfg.settings.max_width,
-                                                    w,
-                                                    egui::RichText::new(name).size(11.0),
-                                                );
+                                        if can_stream_switch {
+                                            ui.add_space(10.0);
+                                            if seg_btn(ui, "子码流", !self.high_stream).clicked()
+                                            {
+                                                self.set_stream(false);
                                             }
-                                        });
-                                    if self.cfg.settings.max_width != mw_before {
-                                        self.apply_max_width_change();
-                                    }
-                                    // 数字变焦（纯软件 UV 裁剪，不动摄像头）
-                                    ui.add_space(10.0);
-                                    if ui
-                                        .add(
-                                            egui::Button::new(egui::RichText::new("−").size(13.0))
+                                            if seg_btn(ui, "主码流", self.high_stream).clicked()
+                                            {
+                                                self.set_stream(true);
+                                            }
+                                        }
+                                        // 解码清晰度档位（max_width 上限）
+                                        ui.add_space(10.0);
+                                        let mw_before = self.cfg.settings.max_width;
+                                        egui::ComboBox::from_id_salt("res_tier")
+                                            .selected_text(
+                                                egui::RichText::new(tier_label(mw_before))
+                                                    .size(11.0),
+                                            )
+                                            .width(84.0)
+                                            .show_ui(ui, |ui| {
+                                                for (name, w) in RES_TIERS {
+                                                    ui.selectable_value(
+                                                        &mut self.cfg.settings.max_width,
+                                                        w,
+                                                        egui::RichText::new(name).size(11.0),
+                                                    );
+                                                }
+                                            });
+                                        if self.cfg.settings.max_width != mw_before {
+                                            self.apply_max_width_change();
+                                        }
+                                        // 数字变焦（纯软件 UV 裁剪，不动摄像头）
+                                        ui.add_space(10.0);
+                                        if ui
+                                            .add(
+                                                egui::Button::new(
+                                                    egui::RichText::new("−").size(13.0),
+                                                )
                                                 .fill(PANEL2)
                                                 .corner_radius(6.0_f32),
-                                        )
-                                        .clicked()
-                                    {
-                                        self.apply_zoom(1.0 / 1.25, egui::vec2(0.5, 0.5));
-                                    }
-                                    ui.label(
-                                        egui::RichText::new(format!("{:.0}%", self.zoom * 100.0))
+                                            )
+                                            .clicked()
+                                        {
+                                            self.apply_zoom(1.0 / 1.25, egui::vec2(0.5, 0.5));
+                                        }
+                                        ui.label(
+                                            egui::RichText::new(format!(
+                                                "{:.0}%",
+                                                self.zoom * 100.0
+                                            ))
                                             .monospace()
                                             .size(11.0)
                                             .color(DIM),
-                                    )
-                                    .on_hover_text("滚轮缩放 · 拖动平移 · 双击画面复位");
-                                    if ui
-                                        .add(
-                                            egui::Button::new(egui::RichText::new("+").size(13.0))
+                                        )
+                                        .on_hover_text("滚轮缩放 · 拖动平移 · 双击进入专注模式");
+                                        if ui
+                                            .add(
+                                                egui::Button::new(
+                                                    egui::RichText::new("+").size(13.0),
+                                                )
                                                 .fill(PANEL2)
                                                 .corner_radius(6.0_f32),
-                                        )
-                                        .clicked()
-                                    {
-                                        self.apply_zoom(1.25, egui::vec2(0.5, 0.5));
-                                    }
-                                    if ui
-                                        .add_enabled(
-                                            self.zoom > 1.0,
-                                            egui::Button::new(
-                                                egui::RichText::new("复位").size(11.0),
                                             )
-                                            .fill(PANEL2)
-                                            .corner_radius(6.0_f32),
-                                        )
-                                        .clicked()
-                                    {
-                                        self.reset_zoom();
-                                    }
-                                },
-                            );
+                                            .clicked()
+                                        {
+                                            self.apply_zoom(1.25, egui::vec2(0.5, 0.5));
+                                        }
+                                        if ui
+                                            .add_enabled(
+                                                self.zoom > 1.0,
+                                                egui::Button::new(
+                                                    egui::RichText::new("复位").size(11.0),
+                                                )
+                                                .fill(PANEL2)
+                                                .corner_radius(6.0_f32),
+                                            )
+                                            .clicked()
+                                        {
+                                            self.reset_zoom();
+                                        }
+                                    },
+                                );
+                            });
                         });
-                    });
-                if self.show_log {
+                }
+                if self.show_log && !self.view_mode.is_focus() {
                     ui.add_space(1.0);
                     self.draw_log_strip(ui, log_h);
+                }
+                if self.view_mode.is_focus() {
+                    self.draw_focus_overlay(ui, rect);
                 }
             });
     }
@@ -2565,16 +2991,54 @@ impl eframe::App for XdView {
                 self.connect_selected();
             }
         }
+        // winit 的装饰切换与尺寸变更是异步的：退出专注的下一帧再钉一次几何，
+        // 避免真机复现的「尺寸没恢复」与「位置漂移」。
+        if let Some((size, pos)) = self.pending_restore.take() {
+            ctx.send_viewport_cmd(egui::ViewportCommand::InnerSize(size));
+            if let Some(p) = pos {
+                ctx.send_viewport_cmd(egui::ViewportCommand::OuterPosition(p));
+            }
+        }
         self.poll_stream(ctx);
         self.poll_control();
         self.poll_cache();
         self.ptz_renew_lease();
         self.emit_stats(ctx);
 
-        self.draw_top(ctx);
-        self.draw_devices(ctx);
-        self.draw_controls(ctx);
-        self.draw_video(ctx);
+        // 悬浮控件续期：指针/滚轮/按键一动就再显示 5 秒（滚轮缩放时要用「复位」）
+        if ctx.input(|i| {
+            i.pointer.delta() != egui::Vec2::ZERO
+                || i.pointer.any_pressed()
+                || i.pointer.any_click()
+                || i.raw_scroll_delta != egui::Vec2::ZERO
+                || i.events
+                    .iter()
+                    .any(|e| matches!(e, egui::Event::Key { pressed: true, .. }))
+        }) {
+            self.hover_until = Some(Instant::now() + Duration::from_secs(5));
+        }
+        // Esc：先关弹窗，再退全屏，最后退专注（键盘优先级从最上层往下）
+        if ctx.input(|i| i.key_pressed(egui::Key::Escape)) {
+            if self.add_open {
+                self.add_open = false;
+                self.add_error.clear();
+            } else if self.ie_open {
+                self.ie_open = false;
+            } else if is_fullscreen(ctx) {
+                self.toggle_fullscreen(ctx);
+            } else if self.view_mode.is_focus() {
+                self.exit_focus(ctx);
+            }
+        }
+
+        if self.view_mode.is_focus() {
+            self.draw_video(ctx);
+        } else {
+            self.draw_top(ctx);
+            self.draw_devices(ctx);
+            self.draw_controls(ctx);
+            self.draw_video(ctx);
+        }
         self.draw_ie_window(ctx);
         self.draw_add_window(ctx);
         self.draw_toast(ctx);
@@ -2592,6 +3056,20 @@ impl eframe::App for XdView {
     /// 最后一片的时长元数据就是错的（实测出现过 393s 的假时长）。
     /// 这里显式停掉缓存/录像，让 ffmpeg 把当前片写完整。
     fn on_exit(&mut self, _gl: Option<&eframe::glow::Context>) {
+        // 窗口几何退出时写一次独立文件，不覆写 config.toml（保留用户注释与外部编辑）。
+        // 专注态尺寸不代表主窗口，只在 Normal / Mini 两态记录。
+        let ctx = self.egui_ctx.clone();
+        match self.view_mode {
+            // 恢复命令还没被下一帧确认时，视口可能是撑大过程中的中间尺寸，别写进 win 槽
+            ViewMode::Normal if self.pending_restore.is_none() => {
+                self.snapshot_geom(&ctx, GeomSlot::Win)
+            }
+            ViewMode::Mini => self.snapshot_geom(&ctx, GeomSlot::Mini),
+            _ => {}
+        }
+        if let Err(e) = self.geom.save(self.storage.root()) {
+            eprintln!("{e}；下次启动将沿用上次的窗口位置");
+        }
         self.stop_cache(false);
         if let Some(rec) = self.recorder.take() {
             let _ = rec.stop();
@@ -2962,6 +3440,56 @@ fn build_visuals() -> egui::Visuals {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn mini_default_size_falls_back_and_limits_bad_aspect() {
+        assert_eq!(mini_default_size(1920.0, 1080.0), (427.0, 240.0));
+        assert_eq!(mini_default_size(0.0, 0.0), (427.0, 240.0));
+        assert_eq!(mini_default_size(1920.0, 0.0), (427.0, 240.0));
+        assert_eq!(mini_default_size(f32::NAN, 9.0), (427.0, 240.0));
+        assert_eq!(mini_default_size(7680.0, 1.0), (1920.0, 240.0));
+    }
+
+    #[test]
+    fn restore_target_always_has_size_and_keeps_negative_position() {
+        // 真机复现：--mini 启动时 win 槽未记忆，旧实现完全不恢复尺寸
+        let (size, pos) = restore_target(None);
+        assert_eq!(size, egui::vec2(1440.0, 900.0));
+        assert!(pos.is_none(), "无记忆时不该把窗口挪到 (0,0)");
+        let (size, pos) = restore_target(Some(GeomRect {
+            x: -267,
+            y: -133,
+            w: 1280,
+            h: 720,
+        }));
+        assert_eq!(size, egui::vec2(1280.0, 720.0));
+        assert_eq!(pos, Some(egui::pos2(-267.0, -133.0)));
+    }
+
+    #[test]
+    fn view_mode_transitions_cover_full_sequence() {
+        // Normal → Focus → Mini → Focus → Normal
+        let mut mode = ViewMode::Normal;
+        mode = mode.after_enter_focus();
+        assert_eq!(mode, ViewMode::Focus);
+        mode = mode.after_enter_mini();
+        assert_eq!(mode, ViewMode::Mini);
+        mode = mode.after_exit_mini();
+        assert_eq!(mode, ViewMode::Focus);
+        mode = mode.after_exit_focus();
+        assert_eq!(mode, ViewMode::Normal);
+        // 已在专注/小窗时重复进入不改变形态；小窗可直接退出专注
+        assert_eq!(ViewMode::Focus.after_enter_focus(), ViewMode::Focus);
+        assert_eq!(ViewMode::Mini.after_enter_focus(), ViewMode::Mini);
+        assert_eq!(ViewMode::Mini.after_exit_focus(), ViewMode::Normal);
+    }
+
+    #[test]
+    fn view_mode_has_no_invalid_combination() {
+        assert!(!ViewMode::Normal.is_focus() && !ViewMode::Normal.is_mini());
+        assert!(ViewMode::Focus.is_focus() && !ViewMode::Focus.is_mini());
+        assert!(ViewMode::Mini.is_focus() && ViewMode::Mini.is_mini());
+    }
 
     #[test]
     fn fit_keeps_aspect() {
