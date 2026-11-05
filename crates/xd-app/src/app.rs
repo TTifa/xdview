@@ -32,8 +32,10 @@ const OVERLAY_GAP: f32 = 7.0;
 /// 按钮行的淡入淡出时长（原型 `transition: opacity .4s`）
 const OVERLAY_FADE: f32 = 0.35;
 
-/// 小窗态右上角按钮行的覆盖宽度（全屏 / 还原 / 复位，最多 3 个）；拖窗时这块不响应拖动。
-const OVERLAY_BUTTONS_W: f32 = 240.0;
+/// 小窗使用更紧凑的按钮与边距；覆盖区按最多三个按钮（含复位）预留。
+const MINI_OVERLAY_MARGIN: f32 = 8.0;
+const MINI_OVERLAY_BTN_H: f32 = 22.0;
+const OVERLAY_BUTTONS_W: f32 = 176.0;
 
 /// 关窗时等待最后一次偏好落盘的上限；超时就放弃——偏好可以丢一次，窗口不能关不掉。
 const CLOSE_DEFER_MAX: Duration = Duration::from_millis(1200);
@@ -156,7 +158,8 @@ fn restore_target(win: Option<GeomRect>) -> (egui::Vec2, Option<egui::Pos2>) {
 /// 拖动起点是否落在专注态右上悬浮按钮区：那里要留给按钮，不能触发拖窗。
 fn drag_started_on_overlay(pos: Option<egui::Pos2>, rect: egui::Rect) -> bool {
     pos.is_some_and(|p| {
-        p.x >= rect.max.x - OVERLAY_BUTTONS_W && p.y <= rect.min.y + OVERLAY_TOP + OVERLAY_BTN_H
+        p.x >= rect.max.x - OVERLAY_BUTTONS_W
+            && p.y <= rect.min.y + MINI_OVERLAY_MARGIN + MINI_OVERLAY_BTN_H
     })
 }
 
@@ -1340,8 +1343,13 @@ impl XdView {
         } else {
             "暂停"
         };
-        if ui
-            .add_enabled(
+        let response = if self.view_mode != ViewMode::Focus {
+            ui.add_enabled_ui(enabled, |ui| {
+                pause_icon_button(ui, &pal, self.preview.paused, on_stage)
+            })
+            .inner
+        } else {
+            ui.add_enabled(
                 enabled,
                 egui::Button::new(egui::RichText::new(text).size(12.0).color(if on_stage {
                     pal.on_stage_text
@@ -1355,7 +1363,13 @@ impl XdView {
                 })
                 .corner_radius(6.0_f32),
             )
-            .on_hover_text("暂停只定格预览；录像和缓存继续。继续后返回实时画面")
+        };
+        if response
+            .on_hover_text(if self.preview.paused {
+                "继续预览（返回实时画面）"
+            } else {
+                "暂停预览（录像和缓存继续）"
+            })
             .clicked()
         {
             self.toggle_preview_pause();
@@ -1599,11 +1613,12 @@ impl XdView {
                                 .size(12.0)
                                 .color(pal.dim),
                         );
-                        ui.add_space(14.0);
-                        let (text, color) = self.status_of();
-                        ui.label(egui::RichText::new("●").size(9.0).color(color));
-                        ui.add_space(4.0);
-                        ui.label(egui::RichText::new(text).size(12.0).color(pal.dim));
+                        // 分辨率与编码已在右侧统计区展示；顶栏仅保留连接异常/等待说明。
+                        if !matches!(self.conn, Conn::Live { .. }) {
+                            ui.add_space(14.0);
+                            let (text, _) = self.status_of();
+                            ui.label(egui::RichText::new(text).size(12.0).color(pal.dim));
+                        }
                     });
                 });
             });
@@ -2023,7 +2038,7 @@ impl XdView {
     }
 
     /// 专注态悬浮按钮：原型 `.focus-exit` 的形态——半透明黑底、白色 28% 描边、
-    /// 13px 图标 + 12px 文字、6px 圆角；悬停加深底色，隐藏前整体淡出。
+    /// 13px 图标 + 12px 文字、6px 圆角；小窗缩至 22px 高、11px 图标和 10px 文字。
     ///
     /// 自绘而不是用 `egui::Button`：图标要 painter 画（中文字体没有对应图形字符），
     /// 且原型要求图标与文字之间 7px 的行内间距，`Button` 只能放纯文本。
@@ -2034,7 +2049,19 @@ impl XdView {
         text: &str,
         active: bool,
         alpha: f32,
+        compact: bool,
     ) -> egui::Response {
+        let (height, pad_x, icon_size, gap, font_size) = if compact {
+            (MINI_OVERLAY_BTN_H, 7.0, 11.0, 4.0, 10.0)
+        } else {
+            (
+                OVERLAY_BTN_H,
+                OVERLAY_PAD_X,
+                OVERLAY_ICON,
+                OVERLAY_GAP,
+                12.0,
+            )
+        };
         let color = if active {
             pal.stage_ok
         } else {
@@ -2042,18 +2069,18 @@ impl XdView {
         };
         let galley = ui.painter().layout_no_wrap(
             text.to_owned(),
-            egui::FontId::proportional(12.0),
+            egui::FontId::proportional(font_size),
             // PLACEHOLDER 让底色在绘制时由 fallback 决定，淡出时不用重建布局
             egui::Color32::PLACEHOLDER,
         );
-        let width = OVERLAY_PAD_X * 2.0 + OVERLAY_ICON + OVERLAY_GAP + galley.size().x;
+        let width = pad_x * 2.0 + icon_size + gap + galley.size().x;
         // 原型 `.idle` 是 opacity:0 + pointer-events:none；淡到一半就不再接受点击
         let sense = if alpha >= 0.5 {
             egui::Sense::click()
         } else {
             egui::Sense::hover()
         };
-        let (rect, resp) = ui.allocate_exact_size(egui::vec2(width, OVERLAY_BTN_H), sense);
+        let (rect, resp) = ui.allocate_exact_size(egui::vec2(width, height), sense);
         let fade = |c: egui::Color32| c.gamma_multiply(alpha);
         let p = ui.painter_at(rect);
         let bg = if resp.hovered() {
@@ -2076,16 +2103,13 @@ impl XdView {
             egui::StrokeKind::Inside,
         );
         let icon_rect = egui::Rect::from_center_size(
-            egui::pos2(
-                rect.left() + OVERLAY_PAD_X + OVERLAY_ICON / 2.0,
-                rect.center().y,
-            ),
-            egui::vec2(OVERLAY_ICON, OVERLAY_ICON),
+            egui::pos2(rect.left() + pad_x + icon_size / 2.0, rect.center().y),
+            egui::vec2(icon_size, icon_size),
         );
         draw_overlay_icon(&p, icon_rect, icon, fade(color));
         p.galley(
             egui::pos2(
-                icon_rect.right() + OVERLAY_GAP,
+                icon_rect.right() + gap,
                 rect.center().y - galley.size().y / 2.0,
             ),
             galley,
@@ -2105,6 +2129,12 @@ impl XdView {
     /// 的 `pointer-events: none`）。
     fn draw_focus_overlay(&mut self, ui: &mut egui::Ui, video_rect: egui::Rect) {
         let pal = self.pal;
+        let compact = self.view_mode.is_mini();
+        let (margin_top, margin_right, height) = if compact {
+            (MINI_OVERLAY_MARGIN, MINI_OVERLAY_MARGIN, MINI_OVERLAY_BTN_H)
+        } else {
+            (OVERLAY_TOP, OVERLAY_RIGHT, OVERLAY_BTN_H)
+        };
         let Some(until) = self.hover_until else {
             return;
         };
@@ -2121,7 +2151,7 @@ impl XdView {
         if self.view_mode.is_mini() {
             let strip = egui::Rect::from_min_size(
                 video_rect.min,
-                egui::vec2(video_rect.width(), OVERLAY_TOP + OVERLAY_BTN_H + 6.0),
+                egui::vec2(video_rect.width(), margin_top + height + 6.0),
             );
             let mut mesh = egui::Mesh::default();
             mesh.colored_vertex(
@@ -2138,17 +2168,17 @@ impl XdView {
             mesh.add_triangle(0, 2, 3);
             ui.painter_at(strip).add(egui::Shape::mesh(mesh));
         }
-        let top = video_rect.min.y + OVERLAY_TOP;
+        let top = video_rect.min.y + margin_top;
         let row = egui::Rect::from_min_max(
             egui::pos2(video_rect.min.x, top),
-            egui::pos2(video_rect.max.x - OVERLAY_RIGHT, top + OVERLAY_BTN_H),
+            egui::pos2(video_rect.max.x - margin_right, top + height),
         );
         ui.allocate_new_ui(egui::UiBuilder::new().max_rect(row), |ui| {
-            ui.spacing_mut().item_spacing.x = 6.0;
+            ui.spacing_mut().item_spacing.x = if compact { 4.0 } else { 6.0 };
             ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                 let ctx = ui.ctx().clone();
                 let button = |ui: &mut egui::Ui, icon, text, active| {
-                    Self::overlay_button(ui, &pal, icon, text, active, alpha)
+                    Self::overlay_button(ui, &pal, icon, text, active, alpha, compact)
                 };
                 if button(ui, OverlayIcon::Fullscreen, "全屏", is_fullscreen(&ctx)).clicked() {
                     self.toggle_fullscreen(&ctx);
@@ -2399,7 +2429,6 @@ impl XdView {
                                 ui.label(
                                     egui::RichText::new(prefix).size(12.0).strong().color(color),
                                 );
-                                self.draw_pause_button(ui, false);
                                 ui.label(
                                     egui::RichText::new(format!(
                                         " · {} · {}",
@@ -2528,14 +2557,26 @@ impl XdView {
                 }
                 if self.view_mode.is_focus() {
                     self.draw_focus_overlay(ui, rect);
-                    // 单独的前景层避免点击暂停按钮时触发视频拖窗；暂停后入口始终可见。
-                    if self.preview.frame.is_some() {
-                        egui::Area::new(egui::Id::new("preview_pause_control"))
-                            .order(egui::Order::Foreground)
-                            .fixed_pos(egui::pos2(rect.left() + 14.0, rect.bottom() - 42.0))
-                            .movable(false)
-                            .show(ctx, |ui| self.draw_pause_button(ui, true));
-                    }
+                }
+                // 所有模式都在画面内提供暂停入口；前景层防止点击时触发视频拖动。
+                if let Some(frame) = &self.preview.frame {
+                    let pause_rect = if self.view_mode == ViewMode::Normal {
+                        fit_rect(rect, frame.width, frame.height)
+                    } else {
+                        rect
+                    };
+                    egui::Area::new(egui::Id::new("preview_pause_control"))
+                        .order(egui::Order::Foreground)
+                        .fixed_pos(if self.view_mode.is_mini() {
+                            egui::pos2(
+                                pause_rect.left() + MINI_OVERLAY_MARGIN,
+                                pause_rect.bottom() - MINI_OVERLAY_MARGIN - MINI_OVERLAY_BTN_H,
+                            )
+                        } else {
+                            egui::pos2(pause_rect.left() + 14.0, pause_rect.bottom() - 42.0)
+                        })
+                        .movable(false)
+                        .show(ctx, |ui| self.draw_pause_button(ui, true));
                 }
             });
     }
@@ -2577,6 +2618,18 @@ impl XdView {
                     });
                 });
                 ui.add_space(2.0);
+                // 日期和时间共 19 字符，按实际等宽字体测量，避免固定 52px 截成「2026-1…」。
+                let stamp_w = ui
+                    .painter()
+                    .layout_no_wrap(
+                        "0000-00-00 00:00:00".to_string(),
+                        egui::FontId::monospace(11.0),
+                        pal.faint,
+                    )
+                    .size()
+                    .x
+                    .ceil()
+                    + 2.0;
                 egui::ScrollArea::vertical()
                     .id_salt("log_body")
                     .stick_to_bottom(true)
@@ -2585,35 +2638,41 @@ impl XdView {
                         for line in &self.log {
                             ui.horizontal(|ui| {
                                 ui.spacing_mut().item_spacing.x = 0.0;
-                                ui.add_sized(
-                                    egui::vec2(52.0, 14.0),
+                                log_cell(
+                                    ui,
+                                    stamp_w,
                                     egui::Label::new(
                                         egui::RichText::new(&line.stamp)
                                             .monospace()
                                             .size(11.0)
                                             .color(pal.faint),
                                     )
-                                    .truncate(),
+                                    .wrap_mode(egui::TextWrapMode::Extend)
+                                    .halign(egui::Align::Min),
                                 );
                                 ui.add_space(10.0);
-                                ui.add_sized(
-                                    egui::vec2(36.0, 14.0),
+                                log_cell(
+                                    ui,
+                                    36.0,
                                     egui::Label::new(
                                         egui::RichText::new(line.level.as_str())
                                             .monospace()
                                             .size(11.0)
                                             .color(line.level.color(&pal)),
                                     )
-                                    .truncate(),
+                                    .truncate()
+                                    .halign(egui::Align::Min),
                                 );
                                 ui.add_space(10.0);
                                 let msg_w = (ui.available_width() - 2.0).max(40.0);
-                                ui.add_sized(
-                                    egui::vec2(msg_w, 14.0),
+                                log_cell(
+                                    ui,
+                                    msg_w,
                                     egui::Label::new(
                                         egui::RichText::new(&line.msg).size(11.0).color(pal.msg),
                                     )
-                                    .truncate(),
+                                    .truncate()
+                                    .halign(egui::Align::Min),
                                 );
                             });
                         }
@@ -3003,7 +3062,7 @@ impl XdView {
             });
             ui.add_space(4.0);
             ui.label(
-                egui::RichText::new("点击预置位跳转（GetGotoPreset）；✕ 删除；上方输入名称存当前位置（SetPreset）。")
+                egui::RichText::new("点击预置位跳转；右侧按钮删除；输入名称后可保存当前位置。")
                     .size(10.0)
                     .color(pal.faint),
             );
@@ -3793,9 +3852,66 @@ enum OverlayIcon {
     Restore,
     /// 复位：放大镜减号（数字变焦复位）
     Reset,
+    /// 暂停预览：双竖条。
+    Pause,
+    /// 继续预览：播放三角。
+    Play,
 }
 
-/// 在 `rect`（正方形）里画 13px 图标；坐标按 0..1 归一化，换尺寸不影响形状。
+/// 普通窗口与小窗共用暂停／继续图标；面板与深色视频层分别选择可读配色。
+fn pause_icon_button(
+    ui: &mut egui::Ui,
+    pal: &Palette,
+    paused: bool,
+    on_stage: bool,
+) -> egui::Response {
+    let response = ui.add_sized(
+        egui::vec2(MINI_OVERLAY_BTN_H, MINI_OVERLAY_BTN_H),
+        egui::Button::new("")
+            .fill(if on_stage {
+                egui::Color32::from_black_alpha(115)
+            } else {
+                pal.panel2
+            })
+            .stroke(egui::Stroke::new(
+                1.0_f32,
+                if on_stage {
+                    egui::Color32::from_white_alpha(71)
+                } else {
+                    pal.border
+                },
+            ))
+            .corner_radius(5.0_f32),
+    );
+    response.widget_info(|| {
+        egui::WidgetInfo::labeled(
+            egui::WidgetType::Button,
+            ui.is_enabled(),
+            if paused {
+                "继续预览"
+            } else {
+                "暂停预览"
+            },
+        )
+    });
+    draw_overlay_icon(
+        &ui.painter_at(response.rect),
+        response.rect.shrink(5.0),
+        if paused {
+            OverlayIcon::Play
+        } else {
+            OverlayIcon::Pause
+        },
+        if on_stage {
+            pal.on_stage_text
+        } else {
+            pal.text
+        },
+    );
+    response
+}
+
+/// 在 `rect`（正方形）里画图标；坐标按 0..1 归一化，换尺寸不影响形状。
 fn draw_overlay_icon(p: &egui::Painter, rect: egui::Rect, icon: OverlayIcon, color: egui::Color32) {
     let w = rect.width();
     let at = |x: f32, y: f32| egui::pos2(rect.min.x + x * w, rect.min.y + y * w);
@@ -3834,6 +3950,22 @@ fn draw_overlay_icon(p: &egui::Painter, rect: egui::Rect, icon: OverlayIcon, col
             p.circle_stroke(at(0.45, 0.45), w * 0.28, stroke);
             p.line_segment([at(0.66, 0.66), at(0.92, 0.92)], stroke);
             p.line_segment([at(0.33, 0.45), at(0.57, 0.45)], stroke);
+        }
+        OverlayIcon::Pause => {
+            for (left, right) in [(0.18, 0.4), (0.6, 0.82)] {
+                p.rect_filled(
+                    egui::Rect::from_min_max(at(left, 0.12), at(right, 0.88)),
+                    0.5_f32,
+                    color,
+                );
+            }
+        }
+        OverlayIcon::Play => {
+            p.add(egui::Shape::convex_polygon(
+                vec![at(0.25, 0.1), at(0.9, 0.5), at(0.25, 0.9)],
+                color,
+                egui::Stroke::NONE,
+            ));
         }
     }
 }
@@ -4087,6 +4219,18 @@ fn tag(ui: &mut egui::Ui, text: &str, color: egui::Color32) {
         });
 }
 
+/// 日志单元格固定列宽并左起排列；add_sized 会居中子控件，仅改 Label::halign 不够。
+fn log_cell(ui: &mut egui::Ui, width: f32, label: egui::Label) {
+    ui.allocate_ui_with_layout(
+        egui::vec2(width, 14.0),
+        egui::Layout::left_to_right(egui::Align::Center),
+        |ui| {
+            ui.set_min_width(width);
+            ui.add(label);
+        },
+    );
+}
+
 /// 右侧区块：标题 + 分隔 + 内容。
 fn section<R>(ui: &mut egui::Ui, pal: &Palette, title: &str, add: impl FnOnce(&mut egui::Ui) -> R) {
     egui::Frame::new()
@@ -4266,14 +4410,36 @@ fn preset_cell(
         *goto = Some(p.token.clone());
     }
     ui.add_space(4.0);
-    if ui
-        .add_sized(
-            egui::vec2(26.0, 28.0),
-            egui::Button::new(egui::RichText::new("✕").size(11.0))
-                .fill(pal.panel2)
-                .stroke(egui::Stroke::new(1.0_f32, pal.border))
-                .corner_radius(6.0_f32),
-        )
+    // 字体不一定包含 ✕，直接画叉号，按钮与说明都不再依赖该字形。
+    let delete = ui.add_sized(
+        egui::vec2(26.0, 28.0),
+        egui::Button::new("")
+            .fill(pal.panel2)
+            .stroke(egui::Stroke::new(1.0_f32, pal.border))
+            .corner_radius(6.0_f32),
+    );
+    delete.widget_info(|| {
+        egui::WidgetInfo::labeled(egui::WidgetType::Button, ui.is_enabled(), "删除预置位")
+    });
+    let center = delete.rect.center();
+    let painter = ui.painter_at(delete.rect);
+    let stroke = egui::Stroke::new(1.4_f32, if delete.hovered() { pal.bad } else { pal.dim });
+    painter.line_segment(
+        [
+            center + egui::vec2(-4.0, -4.0),
+            center + egui::vec2(4.0, 4.0),
+        ],
+        stroke,
+    );
+    painter.line_segment(
+        [
+            center + egui::vec2(-4.0, 4.0),
+            center + egui::vec2(4.0, -4.0),
+        ],
+        stroke,
+    );
+    if delete
+        .on_hover_text(format!("删除预置位「{}」", p.name))
         .clicked()
     {
         *remove = Some(p.token.clone());
@@ -4452,6 +4618,52 @@ fn local_bias_minutes() -> i32 {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn short_log_message_starts_at_left_edge_of_its_column() {
+        let ctx = egui::Context::default();
+        let mut expected_x = 0.0;
+        let output = ctx.run(
+            egui::RawInput {
+                screen_rect: Some(egui::Rect::from_min_size(
+                    egui::Pos2::ZERO,
+                    egui::vec2(600.0, 100.0),
+                )),
+                ..Default::default()
+            },
+            |ctx| {
+                egui::CentralPanel::default().show(ctx, |ui| {
+                    ui.horizontal(|ui| {
+                        ui.spacing_mut().item_spacing.x = 0.0;
+                        ui.add_space(180.0);
+                        expected_x = ui.next_widget_position().x;
+                        log_cell(
+                            ui,
+                            300.0,
+                            egui::Label::new("short log message")
+                                .truncate()
+                                .halign(egui::Align::Min),
+                        );
+                    });
+                });
+            },
+        );
+        let text = output
+            .shapes
+            .iter()
+            .find_map(|shape| match &shape.shape {
+                egui::Shape::Text(text) if text.galley.job.text == "short log message" => {
+                    Some(text)
+                }
+                _ => None,
+            })
+            .expect("日志正文应被绘制");
+        assert!(
+            (text.pos.x - expected_x).abs() < 1.0,
+            "短正文不能在固定宽度列中居中：actual={} expected={expected_x}",
+            text.pos.x
+        );
+    }
 
     fn preview_test_frame(seq: u64, width: usize) -> Frame {
         Frame {
