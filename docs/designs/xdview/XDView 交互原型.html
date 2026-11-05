@@ -23,6 +23,88 @@
     --radius: 8px;
     --mono: "Cascadia Mono", Consolas, "JetBrains Mono", ui-monospace, monospace;
   }
+  /* ============ 日间模式（浅色皮肤） ============ */
+  body.light {
+    --bg: #F2F4F7;
+    --panel: #FFFFFF;
+    --panel2: #F4F6F9;
+    --inset: #EDF0F4;
+    --border: #DCE2EA;
+    --border-strong: #C3CCD8;
+    --text: #1C2534;
+    --dim: #5D6776;
+    --faint: #9AA3B2;
+    --ok: #1E9E63;
+    --warn: #B47A16;
+    --bad: #D24A4A;
+    --info: #2E7DBD;
+    --accent: #1E9E63;
+  }
+  body.light .stage-wrap { background: radial-gradient(ellipse at 50% 40%, #FAFBFD 0%, var(--bg) 75%); }
+  body.light .device-card.active { background: #EDF7F1; }
+  body.light .btn:hover:not(:disabled) { background: #E9EDF3; }
+  body.light .toast { background: #FFFFFF; box-shadow: 0 8px 24px rgba(30, 40, 60, 0.16); }
+  body.light .modal { box-shadow: 0 24px 60px rgba(30, 40, 60, 0.22); }
+  body.light .log-line .msg { color: #414B5C; }
+  body.light ::-webkit-scrollbar-thumb { background: #C9D1DC; border: 2px solid var(--bg); }
+  /* 浅色下把硬编码的深色绿统一替换为可读的深绿 */
+  body.light .btn-scan { color: var(--accent); border-color: rgba(30, 158, 99, 0.4); }
+  body.light .btn-scan:hover:not(:disabled) { background: rgba(30, 158, 99, 0.1); }
+  body.light .btn.accent { color: var(--accent); border-color: rgba(30, 158, 99, 0.4); }
+  body.light .btn.accent:hover:not(:disabled) { background: rgba(30, 158, 99, 0.1); }
+  body.light .seg button.on { color: var(--accent); background: rgba(30, 158, 99, 0.12); }
+  body.light .toggle.on .sw { background: rgba(30, 158, 99, 0.35); }
+  body.light .toggle.on .sw::after { background: var(--accent); }
+  body.light .switch.on { background: rgba(30, 158, 99, 0.35); }
+  body.light .switch.on::after { background: var(--accent); }
+  body.light .found-item.added { border-color: rgba(30, 158, 99, 0.45); }
+  body.light .dpad button.holding { background: rgba(30, 158, 99, 0.16); color: var(--accent); border-color: var(--accent); }
+  body.light .dot.on { box-shadow: 0 0 5px rgba(30, 158, 99, 0.55); }
+  body.light .stat-cell .v.accent { color: var(--accent); }
+  /* 主题切换按钮 */
+  .theme-btn {
+    width: 30px; height: 30px; flex: none;
+    display: flex; align-items: center; justify-content: center;
+    border: 1px solid var(--border); border-radius: 6px;
+    background: var(--panel2); color: var(--dim);
+    transition: color 0.15s, border-color 0.15s;
+  }
+  .theme-btn:hover { color: var(--text); border-color: var(--border-strong); }
+  .theme-btn svg { width: 15px; height: 15px; }
+  .theme-btn .icon-sun { display: none; }
+  body.light .theme-btn .icon-sun { display: block; }
+  body.light .theme-btn .icon-moon { display: none; }
+  .theme-btn.wide { width: auto; padding: 0 10px; gap: 6px; font-size: 12px; }
+
+  /* ============ 专注模式 ============ */
+  body.focus .topbar,
+  body.focus .sidebar,
+  body.focus .right,
+  body.focus .video-bar,
+  body.focus .log-panel { display: none; }
+  body.focus .main { grid-template-columns: 1fr; }
+  body.focus .stage-wrap { padding: 0; background: #05060A; }
+  body.focus .stage {
+    max-width: calc(100vh * 1.7778);
+    border: none;
+    border-radius: 0;
+  }
+  body.focus .ov-tr { top: 56px; }
+  .focus-exit {
+    position: absolute; top: 14px; right: 14px; z-index: 20;
+    display: none; align-items: center; gap: 7px;
+    background: rgba(0, 0, 0, 0.45);
+    border: 1px solid rgba(255, 255, 255, 0.28);
+    border-radius: 6px;
+    color: #fff; font-size: 12px;
+    padding: 6px 12px;
+    backdrop-filter: blur(4px);
+    transition: opacity 0.4s, background 0.15s;
+  }
+  body.focus .focus-exit { display: flex; }
+  .focus-exit:hover { background: rgba(0, 0, 0, 0.7); }
+  .focus-exit.idle { opacity: 0; pointer-events: none; }
+  .focus-exit svg { width: 13px; height: 13px; }
   * { margin: 0; padding: 0; box-sizing: border-box; }
   html, body { height: 100%; }
   body {
@@ -517,6 +599,14 @@
   <div class="spacer"></div>
   <div class="global-state"><span class="dot on" id="global-dot"></span><span id="global-text">ONVIF 服务正常</span></div>
   <span id="clock">--:--:--</span>
+  <button class="theme-btn" id="theme-btn" title="切换日间 / 夜间模式">
+    <svg class="icon-moon" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M21 12.8A9 9 0 1 1 11.2 3a7 7 0 0 0 9.8 9.8z"></path></svg>
+    <svg class="icon-sun" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round"><circle cx="12" cy="12" r="4"></circle><path d="M12 2v2M12 20v2M4.9 4.9l1.4 1.4M17.7 17.7l1.4 1.4M2 12h2M20 12h2M4.9 19.1l1.4-1.4M17.7 6.3l1.4-1.4"></path></svg>
+  </button>
+  <button class="theme-btn wide" id="focus-btn" title="专注模式：只看视频（Esc 退出）">
+    <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M3 8V5a2 2 0 0 1 2-2h3M16 3h3a2 2 0 0 1 2 2v3M21 16v3a2 2 0 0 1-2 2h-3M8 21H5a2 2 0 0 1-2-2v-3"></path></svg>
+    专注
+  </button>
 </header>
 
 <!-- ===================== 主布局 ===================== -->
@@ -661,6 +751,11 @@
           <div class="big" id="conn-big">未连接</div>
           <div class="detail" id="conn-detail">从左侧选择设备开始预览</div>
         </div>
+
+        <button class="focus-exit" id="focus-exit" title="退出专注模式（Esc）">
+          <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M8 3v3a2 2 0 0 1-2 2H3M21 8h-3a2 2 0 0 1-2-2V3M3 16h3a2 2 0 0 1 2 2v3M16 21v-3a2 2 0 0 1 2-2h3"></path></svg>
+          还原
+        </button>
       </div>
     </div>
 
@@ -1315,6 +1410,49 @@
     $("ov-stats").textContent = w + "×" + h + " · H.264 · " + fps.toFixed(1) + " fps";
     $("ov-latency").textContent = "延迟 " + (110 + Math.round(Math.random() * 40)) + " ms · TCP";
   }, 1000);
+
+  /* ---------- 主题切换（夜间 / 日间皮肤） ---------- */
+  var THEME_KEY = "xdview-theme";
+  function currentThemeLight() { return document.body.classList.contains("light"); }
+  function setTheme(light, silent) {
+    document.body.classList.toggle("light", light);
+    try { localStorage.setItem(THEME_KEY, light ? "light" : "dark"); } catch (e) { /* file:// 下可能被禁，忽略 */ }
+    if (!silent) { log("INFO", light ? "主题 → 日间模式（浅色皮肤）" : "主题 → 夜间模式（深色皮肤）"); }
+  }
+  try {
+    if (localStorage.getItem(THEME_KEY) === "light") { document.body.classList.add("light"); }
+  } catch (e) { /* 忽略 */ }
+  $("theme-btn").addEventListener("click", function () {
+    setTheme(!currentThemeLight(), false);
+  });
+
+  /* ---------- 专注模式 ---------- */
+  var focusIdleTimer = null;
+  function setFocus(on) {
+    document.body.classList.toggle("focus", on);
+    if (on) {
+      log("INFO", "进入专注模式：只保留视频画面");
+      armFocusIdle();
+    } else {
+      clearTimeout(focusIdleTimer);
+      $("focus-exit").classList.remove("idle");
+      log("INFO", "已退出专注模式。");
+    }
+  }
+  function armFocusIdle() {
+    var btn = $("focus-exit");
+    btn.classList.remove("idle");
+    clearTimeout(focusIdleTimer);
+    focusIdleTimer = setTimeout(function () { btn.classList.add("idle"); }, 4000);
+  }
+  document.addEventListener("mousemove", function () {
+    if (document.body.classList.contains("focus")) { armFocusIdle(); }
+  });
+  $("focus-btn").addEventListener("click", function () { setFocus(true); });
+  $("focus-exit").addEventListener("click", function () { setFocus(false); });
+  document.addEventListener("keydown", function (e) {
+    if (e.key === "Escape" && document.body.classList.contains("focus")) { setFocus(false); }
+  });
 
   /* ---------- 启动 ---------- */
   renderDevices();

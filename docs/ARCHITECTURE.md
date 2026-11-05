@@ -82,6 +82,8 @@ crates/xd-app/              egui 界面
   src/control.rs            ONVIF 后台线程（不阻塞 UI）
   src/font.rs               中文字体加载 + TTC→TTF 抽取
   src/storage.rs            系统用户数据目录、自定义路径与输出路径边界、窗口几何独立文件
+  src/theme.rs              深色 / 浅色色板、egui 视觉与界面偏好（ui_prefs.toml）
+  src/prefs.rs              界面偏好的后台写盘线程（合并请求、回执、关窗暂缓）
 
 docs/                       公开文档见 docs/README.md
   local/                    原始研究报告、现场记录与 APK（仅本地，不入库）

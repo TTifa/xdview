@@ -11,7 +11,9 @@
 mod app;
 mod control;
 mod font;
+mod prefs;
 mod storage;
+mod theme;
 
 use std::path::{Path, PathBuf};
 
@@ -249,6 +251,9 @@ fn main() -> eframe::Result {
     // 窗口几何存独立文件，不写回 config.toml（保留用户注释与外部编辑）。
     // 位置允许负坐标：多屏副屏在左/上方时本就是负值。
     let geom = storage::WindowGeom::load(storage.root());
+    // 界面偏好同样在窗口创建前读：启动路径上不出现「UI 线程读慢盘」。
+    // 文件很小，但 data_dir 可能指向响应缓慢的网络位置，读也值得放在窗口之前。
+    let theme = theme::Theme::load(storage.root());
     // --mini 只看小窗槽：拿主窗口槽兜底会让首帧以 1440×900 建窗再缩小，闪一下。
     let initial = if start_mini { geom.mini } else { geom.win };
     let (w, h) = if start_mini {
@@ -279,7 +284,7 @@ fn main() -> eframe::Result {
         "xdview",
         options,
         Box::new(move |cc| {
-            let mut view = app::XdView::new(cc, cfg, cfg_path, storage, geom);
+            let mut view = app::XdView::new(cc, cfg, cfg_path, storage, geom, theme);
             if start_focus {
                 view.start_focus_mode(&cc.egui_ctx, start_mini);
             }

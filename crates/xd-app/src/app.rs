@@ -5,7 +5,9 @@
 
 use crate::control::{Command, ControlLink, Feedback, Session, LEASE_RENEW};
 use crate::font;
+use crate::prefs::{PrefsWriter, Saved};
 use crate::storage::{GeomRect, StoragePaths, WindowGeom};
+use crate::theme::{Palette, Theme};
 use eframe::egui;
 use std::collections::VecDeque;
 use std::path::PathBuf;
@@ -17,25 +19,24 @@ use xd_core::onvif::{Credentials, Preset, Profile, Velocity};
 use xd_media::stream::{Event, Stream, StreamOptions};
 use xd_media::{CacheOptions, Frame, NetOptions, Recorder, SegmentCache};
 
-// ---- 原型色板（与 HTML 原型 :root 变量一一对应）----
-const BG: egui::Color32 = egui::Color32::from_rgb(9, 10, 12);
-const PANEL: egui::Color32 = egui::Color32::from_rgb(16, 19, 24);
-const PANEL2: egui::Color32 = egui::Color32::from_rgb(21, 26, 34);
-const INSET: egui::Color32 = egui::Color32::from_rgb(12, 15, 20);
-const BORDER: egui::Color32 = egui::Color32::from_rgb(30, 36, 48);
-const BORDER_STRONG: egui::Color32 = egui::Color32::from_rgb(42, 50, 66);
-const TEXT: egui::Color32 = egui::Color32::from_rgb(230, 233, 239);
-const DIM: egui::Color32 = egui::Color32::from_rgb(138, 146, 163);
-const FAINT: egui::Color32 = egui::Color32::from_rgb(86, 94, 110);
-const OK: egui::Color32 = egui::Color32::from_rgb(86, 200, 140);
-const WARN: egui::Color32 = egui::Color32::from_rgb(232, 178, 74);
-const BAD: egui::Color32 = egui::Color32::from_rgb(226, 96, 96);
-const INFO: egui::Color32 = egui::Color32::from_rgb(92, 168, 232);
-const MSG: egui::Color32 = egui::Color32::from_rgb(183, 190, 203);
-const ACTIVE_BG: egui::Color32 = egui::Color32::from_rgb(19, 27, 24);
+// 色板见 `theme.rs`：夜间/日间两套，字段与原型 CSS 变量一一对应。
+// 绘制函数统一先 `let pal = self.pal;` 取一份副本，避免闭包里读字段和 `&mut self` 打架。
 
-/// 悬浮按钮和拖窗排除区共用的宽度。
-const OVERLAY_BUTTONS_W: f32 = 230.0;
+/// 专注态悬浮按钮的度量，对齐原型 `.focus-exit`：14px 外边距、12px 内边距、13px 图标。
+const OVERLAY_TOP: f32 = 14.0;
+const OVERLAY_RIGHT: f32 = 14.0;
+const OVERLAY_BTN_H: f32 = 28.0;
+const OVERLAY_PAD_X: f32 = 12.0;
+const OVERLAY_ICON: f32 = 13.0;
+const OVERLAY_GAP: f32 = 7.0;
+/// 按钮行的淡入淡出时长（原型 `transition: opacity .4s`）
+const OVERLAY_FADE: f32 = 0.35;
+
+/// 右上角按钮行的预留宽度（4 个按钮 + 间距 + 边距）；拖窗时这块不响应拖动。
+const OVERLAY_BUTTONS_W: f32 = 310.0;
+
+/// 关窗时等待最后一次偏好落盘的上限；超时就放弃——偏好可以丢一次，窗口不能关不掉。
+const CLOSE_DEFER_MAX: Duration = Duration::from_millis(1200);
 
 /// 界面形态：普通三栏 / 专注（只看视频）/ 小窗（专注 + 无边框置顶）。
 /// 全屏由视口单独管理。
@@ -150,7 +151,9 @@ fn restore_target(win: Option<GeomRect>) -> (egui::Vec2, Option<egui::Pos2>) {
 
 /// 拖动起点是否落在专注态右上悬浮按钮区：那里要留给按钮，不能触发拖窗。
 fn drag_started_on_overlay(pos: Option<egui::Pos2>, rect: egui::Rect) -> bool {
-    pos.is_some_and(|p| p.x >= rect.max.x - OVERLAY_BUTTONS_W && p.y <= rect.min.y + 28.0)
+    pos.is_some_and(|p| {
+        p.x >= rect.max.x - OVERLAY_BUTTONS_W && p.y <= rect.min.y + OVERLAY_TOP + OVERLAY_BTN_H
+    })
 }
 
 enum Conn {
@@ -183,12 +186,12 @@ impl Level {
         }
     }
 
-    fn color(self) -> egui::Color32 {
+    fn color(self, pal: &Palette) -> egui::Color32 {
         match self {
-            Level::Info => INFO,
-            Level::Ok => OK,
-            Level::Warn => WARN,
-            Level::Err => BAD,
+            Level::Info => pal.info,
+            Level::Ok => pal.ok,
+            Level::Warn => pal.warn,
+            Level::Err => pal.bad,
         }
     }
 }
@@ -313,6 +316,17 @@ pub struct XdView {
     add_user: String,
     add_pass: String,
     add_error: String,
+    /// 当前主题（夜间 / 日间），与 `pal` 同步切换
+    theme: Theme,
+    /// 当前色板快照；所有绘制读这里，不在各处硬编码颜色
+    pal: Palette,
+    /// 主题偏好由后台线程写盘，UI 只投递
+    prefs: PrefsWriter,
+    /// 最后一次投递的写序号；`Some` 表示「可能还没落盘」，关窗暂缓据此判断。
+    /// 写线程若意外退出，回执不会再来，`Some` 会一直留着——关窗仍有 1.2s 上限兜底。
+    pending_theme: Option<u64>,
+    /// 关窗暂缓的截止时刻：用户点了关闭，但最后一次写还没回来
+    close_deadline: Option<Instant>,
 }
 
 /// 转速档 → ContinuousMove 速度。
@@ -338,8 +352,11 @@ impl XdView {
         cfg_path: PathBuf,
         storage: StoragePaths,
         geom: WindowGeom,
+        theme: Theme,
     ) -> Self {
-        cc.egui_ctx.set_visuals(build_visuals());
+        // 主题在 `main` 里（窗口创建前）读取并传进来，UI 线程不碰偏好文件。
+        let pal = Palette::of(theme);
+        apply_theme(&cc.egui_ctx, theme);
         let cjk = font::find_cjk_font();
         let cjk_note = match &cjk {
             Some(f) => format!("中文字体：{}", f.name),
@@ -359,6 +376,8 @@ impl XdView {
         }
 
         let high_stream = cfg.settings.high_stream;
+        // 写线程在窗口之前起好：首次切换主题时直接投递，不必临时建线程
+        let prefs = PrefsWriter::spawn(storage.root().to_path_buf());
 
         let mut view = XdView {
             cfg,
@@ -413,6 +432,11 @@ impl XdView {
             add_user: String::new(),
             add_pass: String::new(),
             add_error: String::new(),
+            theme,
+            pal,
+            prefs,
+            pending_theme: None,
+            close_deadline: None,
         };
         view.push_log(format!(
             "配置：{}（{} 路摄像机）",
@@ -509,13 +533,14 @@ impl XdView {
             cam, size, self.stats.frames, self.stats.fps, self.stats.mb_per_s, tag
         );
         eprintln!(
-            "[dbg] screen={:?} left_w={:.1} right_w={:.1} zoom={:.2} mode={:?} fs={}",
+            "[dbg] screen={:?} left_w={:.1} right_w={:.1} zoom={:.2} mode={:?} fs={} theme={:?}",
             ctx.screen_rect(),
             self.left_w,
             self.right_w,
             self.zoom,
             self.view_mode,
-            is_fullscreen(ctx)
+            is_fullscreen(ctx),
+            self.theme
         );
     }
 
@@ -1153,15 +1178,83 @@ impl XdView {
     }
 
     fn status_of(&self) -> (String, egui::Color32) {
+        let pal = &self.pal;
         match &self.conn {
-            Conn::Idle => ("未连接".to_string(), DIM),
-            Conn::Connecting => ("连接中…".to_string(), WARN),
+            Conn::Idle => ("未连接".to_string(), pal.dim),
+            Conn::Connecting => ("连接中…".to_string(), pal.warn),
             Conn::Live {
                 width,
                 height,
                 codec,
-            } => (format!("{width}x{height} {codec}"), OK),
-            Conn::Failed(e) => (format!("失败：{e}"), BAD),
+            } => (format!("{width}x{height} {codec}"), pal.ok),
+            Conn::Failed(e) => (format!("失败：{e}"), pal.bad),
+        }
+    }
+
+    /// 切换主题：更新色板与 egui 视觉，并把偏好交给后台线程落盘。
+    ///
+    /// UI 线程不做文件 I/O（`data_dir` 可能在慢盘或网络位置）；这里只投递并记下序号，
+    /// 回执由 [`Self::poll_prefs`] 处理。偏好只写 `ui_prefs.toml`，不碰 `config.toml`
+    /// ——那里有明文密码和用户注释。
+    fn set_theme(&mut self, ctx: &egui::Context, theme: Theme) {
+        if self.theme == theme {
+            return;
+        }
+        self.theme = theme;
+        self.pal = Palette::of(theme);
+        apply_theme(ctx, theme);
+        self.push_log(format!("主题 → {}", theme.label()));
+        // 只投递不落盘：data_dir 在慢盘/网络位置时，写盘不能卡住绘制与云台续租
+        self.pending_theme = Some(self.prefs.send(theme));
+    }
+
+    /// 轮询偏好写盘结果：失败要告诉用户，成功则解除「待落盘」状态。
+    fn poll_prefs(&mut self) -> bool {
+        let mut failed = false;
+        while let Some(saved) = self.prefs.try_recv() {
+            let Some(saved) = take_latest_save(&mut self.pending_theme, saved) else {
+                continue;
+            };
+            if let Err(e) = saved.result {
+                failed = true;
+                let label = saved.theme.label();
+                self.push_lv(Level::Warn, format!("主题偏好保存失败（{label}）：{e}"));
+                self.toast("主题已切换，但偏好保存失败：下次启动可能恢复原主题");
+            }
+        }
+        failed
+    }
+
+    /// 点关闭时若最后一次偏好写还在路上，最多等 [`CLOSE_DEFER_MAX`]。
+    ///
+    /// 暂缓期间界面照常响应（不 join、不阻塞），写回执或超时后再真正关闭。
+    /// 暂缓期内再点一次关闭视为「坚持要关」，直接放行——不能让用户觉得窗口关不掉。
+    fn guard_close(&mut self, ctx: &egui::Context, save_failed: bool) {
+        let requested = ctx.input(|i| i.viewport().close_requested());
+        let now = Instant::now();
+        match advance_close(
+            &mut self.close_deadline,
+            requested,
+            self.pending_theme.is_some(),
+            now,
+            save_failed,
+        ) {
+            // 没有待落盘的写，或用户在暂缓期间再次点关闭：不拦
+            CloseAction::Pass => {}
+            CloseAction::Defer => {
+                ctx.send_viewport_cmd(egui::ViewportCommand::CancelClose);
+                ctx.request_repaint_after(Duration::from_millis(30));
+            }
+            CloseAction::Wait => ctx.request_repaint_after(Duration::from_millis(30)),
+            CloseAction::ShowFailure => {
+                if requested {
+                    ctx.send_viewport_cmd(egui::ViewportCommand::CancelClose);
+                }
+                ctx.request_repaint();
+            }
+            CloseAction::CloseNow => {
+                ctx.send_viewport_cmd(egui::ViewportCommand::Close);
+            }
         }
     }
 
@@ -1259,11 +1352,12 @@ impl XdView {
 
 impl XdView {
     fn draw_top(&mut self, ctx: &egui::Context) {
+        let pal = self.pal;
         egui::TopBottomPanel::top("top")
             .frame(
                 egui::Frame::new()
-                    .fill(PANEL)
-                    .stroke(egui::Stroke::new(1.0_f32, BORDER))
+                    .fill(pal.panel)
+                    .stroke(egui::Stroke::new(1.0_f32, pal.border))
                     .inner_margin(egui::Margin {
                         left: 16,
                         right: 16,
@@ -1277,70 +1371,68 @@ impl XdView {
                         egui::RichText::new("xdview")
                             .size(15.0)
                             .strong()
-                            .color(TEXT),
+                            .color(pal.text),
                     );
                     ui.add_space(6.0);
                     ui.label(
                         egui::RichText::new("智能摄像机客户端")
                             .size(11.0)
-                            .color(FAINT),
+                            .color(pal.faint),
                     );
                     ui.add_space(12.0);
 
-                    chip(ui, "ONVIF", !self.profiles.is_empty());
+                    chip(ui, &pal, "ONVIF", !self.profiles.is_empty());
                     let transport = self
                         .current()
                         .map(|c| c.transport().as_str().to_string())
                         .unwrap_or_else(|| "RTSP".into());
-                    chip(ui, &format!("{transport} · TCP"), true);
-                    chip(ui, "DVR 缓存", self.cache_running());
+                    chip(ui, &pal, &format!("{transport} · TCP"), true);
+                    chip(ui, &pal, "DVR 缓存", self.cache_running());
 
                     ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                        if ui
-                            .add(
-                                egui::Button::new(
-                                    egui::RichText::new("▣ 专注")
-                                        .size(12.0)
-                                        .strong()
-                                        .color(egui::Color32::from_rgb(138, 224, 178)),
-                                )
-                                .fill(egui::Color32::from_rgb(26, 52, 38))
-                                .stroke(egui::Stroke::new(
-                                    1.5_f32,
-                                    egui::Color32::from_rgb(92, 176, 130),
-                                ))
-                                .corner_radius(8.0_f32),
-                            )
-                            .on_hover_text("只看视频（双击画面 / Esc 退出）")
-                            .clicked()
+                        if topbar_button(
+                            ui,
+                            &pal,
+                            Some("专注"),
+                            "只看视频（双击画面 / Esc 退出）",
+                            |p, rect, fg| draw_overlay_icon(p, rect, OverlayIcon::Fullscreen, fg),
+                        )
+                        .clicked()
                         {
                             self.enter_focus(ctx, true);
                         }
-                        ui.add_space(10.0);
+                        ui.add_space(8.0);
+                        // 主题切换（与原型顶栏同一个位置：专注按钮左侧）
+                        if theme_button(ui, &pal, self.theme.is_light()).clicked() {
+                            let next = self.theme.toggle();
+                            self.set_theme(ctx, next);
+                        }
+                        ui.add_space(12.0);
                         ui.label(
                             egui::RichText::new(self.stamp())
                                 .monospace()
                                 .size(12.0)
-                                .color(DIM),
+                                .color(pal.dim),
                         );
                         ui.add_space(14.0);
                         let (text, color) = self.status_of();
                         ui.label(egui::RichText::new("●").size(9.0).color(color));
                         ui.add_space(4.0);
-                        ui.label(egui::RichText::new(text).size(12.0).color(DIM));
+                        ui.label(egui::RichText::new(text).size(12.0).color(pal.dim));
                     });
                 });
             });
     }
 
     fn draw_devices(&mut self, ctx: &egui::Context) {
+        let pal = self.pal;
         egui::SidePanel::left("devices")
             .resizable(false)
             .exact_width(self.left_w)
             .frame(
                 egui::Frame::new()
-                    .fill(PANEL)
-                    .stroke(egui::Stroke::new(1.0_f32, BORDER))
+                    .fill(pal.panel)
+                    .stroke(egui::Stroke::new(1.0_f32, pal.border))
                     .inner_margin(egui::Margin {
                         left: 10,
                         right: 10,
@@ -1354,23 +1446,23 @@ impl XdView {
                         egui::RichText::new("设备")
                             .size(12.0)
                             .strong()
-                            .color(DIM),
+                            .color(pal.dim),
                     );
                     ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                         let scanning = self.scanning;
                         let label = if scanning { "扫描中…" } else { "扫描局域网" };
                         let btn = egui::Button::new(egui::RichText::new(label).size(12.0))
                             .fill(if scanning {
-                                egui::Color32::from_rgb(40, 34, 20)
+                                pal.warn_fill
                             } else {
                                 egui::Color32::TRANSPARENT
                             })
                             .stroke(egui::Stroke::new(
                                 1.0_f32,
                                 if scanning {
-                                    egui::Color32::from_rgb(120, 96, 40)
+                                    pal.warn_stroke
                                 } else {
-                                    egui::Color32::from_rgb(46, 88, 66)
+                                    pal.accent_stroke
                                 },
                             ))
                             .corner_radius(6.0_f32);
@@ -1392,13 +1484,13 @@ impl XdView {
                             let selected = i == self.selected;
                             let status = self.device_status(i);
                             let frame = egui::Frame::new()
-                                .fill(if selected { ACTIVE_BG } else { PANEL2 })
+                                .fill(if selected { pal.active_bg } else { pal.panel2 })
                                 .stroke(egui::Stroke::new(
                                     1.0_f32,
                                     if selected {
-                                        egui::Color32::from_rgb(58, 110, 84)
+                                        pal.accent_stroke
                                     } else {
-                                        BORDER
+                                        pal.border
                                     },
                                 ))
                                 .corner_radius(8.0_f32)
@@ -1415,7 +1507,7 @@ impl XdView {
                                         egui::RichText::new(cam.name.as_str())
                                             .size(13.0)
                                             .strong()
-                                            .color(if selected { TEXT } else { DIM }),
+                                            .color(if selected { pal.text } else { pal.dim }),
                                     );
                                     ui.with_layout(
                                         egui::Layout::right_to_left(egui::Align::Center),
@@ -1424,7 +1516,7 @@ impl XdView {
                                                 egui::RichText::new(cam.transport().as_str())
                                                     .monospace()
                                                     .size(10.0)
-                                                    .color(FAINT),
+                                                    .color(pal.faint),
                                             );
                                         },
                                     );
@@ -1435,7 +1527,7 @@ impl XdView {
                                         egui::RichText::new(cam.id.as_str())
                                             .monospace()
                                             .size(10.0)
-                                            .color(FAINT),
+                                            .color(pal.faint),
                                     );
                                     ui.with_layout(
                                         egui::Layout::right_to_left(egui::Align::Center),
@@ -1472,7 +1564,7 @@ impl XdView {
                             ui.label(
                                 egui::RichText::new("发现（点接入即自动取流）")
                                     .size(11.0)
-                                    .color(FAINT),
+                                    .color(pal.faint),
                             );
                             ui.add_space(4.0);
                             let list = self.discovered.clone();
@@ -1494,7 +1586,7 @@ impl XdView {
                                             egui::Button::new(
                                                 egui::RichText::new("已添加").size(10.0),
                                             )
-                                            .fill(PANEL2)
+                                            .fill(pal.panel2)
                                             .corner_radius(6.0_f32),
                                         );
                                     } else if ui.small_button("接入").clicked() {
@@ -1503,7 +1595,7 @@ impl XdView {
                                     ui.label(
                                         egui::RichText::new(dev.display_name())
                                             .size(12.0)
-                                            .color(MSG),
+                                            .color(pal.msg),
                                     );
                                 });
                                 ui.label(
@@ -1512,7 +1604,7 @@ impl XdView {
                                     )
                                     .monospace()
                                     .size(10.0)
-                                    .color(FAINT),
+                                    .color(pal.faint),
                                 );
                                 ui.add_space(4.0);
                             }
@@ -1529,11 +1621,8 @@ impl XdView {
                             egui::Button::new(
                                 egui::RichText::new("＋ 添加设备（手填 ONVIF）").size(12.0),
                             )
-                            .fill(egui::Color32::from_rgb(28, 44, 36))
-                            .stroke(egui::Stroke::new(
-                                1.0_f32,
-                                egui::Color32::from_rgb(58, 110, 84),
-                            ))
+                            .fill(pal.accent_fill)
+                            .stroke(egui::Stroke::new(1.0_f32, pal.accent_stroke))
                             .corner_radius(6.0_f32),
                         )
                         .clicked()
@@ -1546,8 +1635,8 @@ impl XdView {
                         if ui
                             .add(
                                 egui::Button::new(egui::RichText::new("连接").size(12.0))
-                                    .fill(PANEL2)
-                                    .stroke(egui::Stroke::new(1.0_f32, BORDER))
+                                    .fill(pal.panel2)
+                                    .stroke(egui::Stroke::new(1.0_f32, pal.border))
                                     .corner_radius(6.0_f32),
                             )
                             .clicked()
@@ -1557,11 +1646,8 @@ impl XdView {
                         if ui
                             .add(
                                 egui::Button::new(egui::RichText::new("断开").size(12.0))
-                                    .fill(PANEL2)
-                                    .stroke(egui::Stroke::new(
-                                        1.0_f32,
-                                        egui::Color32::from_rgb(96, 52, 52),
-                                    ))
+                                    .fill(pal.panel2)
+                                    .stroke(egui::Stroke::new(1.0_f32, pal.danger_stroke))
                                     .corner_radius(6.0_f32),
                             )
                             .clicked()
@@ -1574,8 +1660,8 @@ impl XdView {
                         if ui
                             .add(
                                 egui::Button::new(egui::RichText::new("导入设备").size(12.0))
-                                    .fill(PANEL2)
-                                    .stroke(egui::Stroke::new(1.0_f32, BORDER))
+                                    .fill(pal.panel2)
+                                    .stroke(egui::Stroke::new(1.0_f32, pal.border))
                                     .corner_radius(6.0_f32),
                             )
                             .clicked()
@@ -1585,8 +1671,8 @@ impl XdView {
                         if ui
                             .add(
                                 egui::Button::new(egui::RichText::new("导出设备").size(12.0))
-                                    .fill(PANEL2)
-                                    .stroke(egui::Stroke::new(1.0_f32, BORDER))
+                                    .fill(pal.panel2)
+                                    .stroke(egui::Stroke::new(1.0_f32, pal.border))
                                     .corner_radius(6.0_f32),
                             )
                             .clicked()
@@ -1600,14 +1686,14 @@ impl XdView {
                             "一次只连一路。断流的设备会按指数退避自动重连。\nONVIF 地址填到主机即可（如 http://192.168.1.64:8080），\n流地址经 GetStreamUri 自动获取。",
                         )
                         .size(11.0)
-                        .color(FAINT),
+                        .color(pal.faint),
                     );
                     if !self.device_info.is_empty() {
                         ui.label(
                             egui::RichText::new(self.device_info.as_str())
                                 .monospace()
                                 .size(10.0)
-                                .color(FAINT),
+                                .color(pal.faint),
                         );
                     }
                 });
@@ -1616,14 +1702,15 @@ impl XdView {
 
     /// 设备卡片右下角的状态标签。
     fn device_status(&self, i: usize) -> (&'static str, egui::Color32) {
+        let pal = &self.pal;
         if i != self.selected {
-            return ("未连接", FAINT);
+            return ("未连接", pal.faint);
         }
         match &self.conn {
-            Conn::Live { .. } => ("在线", OK),
-            Conn::Connecting => ("连接中", WARN),
-            Conn::Failed(_) => ("失败", BAD),
-            Conn::Idle => ("未连接", FAINT),
+            Conn::Live { .. } => ("在线", pal.ok),
+            Conn::Connecting => ("连接中", pal.warn),
+            Conn::Failed(_) => ("失败", pal.bad),
+            Conn::Idle => ("未连接", pal.faint),
         }
     }
 
@@ -1799,61 +1886,144 @@ impl XdView {
         mini_default_size(fw, fh)
     }
 
-    fn overlay_button(ui: &mut egui::Ui, text: &str, active: bool) -> egui::Response {
-        ui.add(
-            egui::Button::new(egui::RichText::new(text).size(11.0).color(if active {
-                OK
-            } else {
-                TEXT
-            }))
-            .fill(egui::Color32::from_black_alpha(120))
-            .stroke(egui::Stroke::new(
+    /// 专注态悬浮按钮：原型 `.focus-exit` 的形态——半透明黑底、白色 28% 描边、
+    /// 13px 图标 + 12px 文字、6px 圆角；悬停加深底色，隐藏前整体淡出。
+    ///
+    /// 自绘而不是用 `egui::Button`：图标要 painter 画（中文字体没有对应图形字符），
+    /// 且原型要求图标与文字之间 7px 的行内间距，`Button` 只能放纯文本。
+    fn overlay_button(
+        ui: &mut egui::Ui,
+        pal: &Palette,
+        icon: OverlayIcon,
+        text: &str,
+        active: bool,
+        alpha: f32,
+    ) -> egui::Response {
+        let color = if active {
+            pal.stage_ok
+        } else {
+            pal.on_stage_text
+        };
+        let galley = ui.painter().layout_no_wrap(
+            text.to_owned(),
+            egui::FontId::proportional(12.0),
+            // PLACEHOLDER 让底色在绘制时由 fallback 决定，淡出时不用重建布局
+            egui::Color32::PLACEHOLDER,
+        );
+        let width = OVERLAY_PAD_X * 2.0 + OVERLAY_ICON + OVERLAY_GAP + galley.size().x;
+        // 原型 `.idle` 是 opacity:0 + pointer-events:none；淡到一半就不再接受点击
+        let sense = if alpha >= 0.5 {
+            egui::Sense::click()
+        } else {
+            egui::Sense::hover()
+        };
+        let (rect, resp) = ui.allocate_exact_size(egui::vec2(width, OVERLAY_BTN_H), sense);
+        let fade = |c: egui::Color32| c.gamma_multiply(alpha);
+        let p = ui.painter_at(rect);
+        let bg = if resp.hovered() {
+            egui::Color32::from_black_alpha(179) // rgba(0,0,0,.7)
+        } else {
+            egui::Color32::from_black_alpha(115) // rgba(0,0,0,.45)
+        };
+        p.rect_filled(rect, 6.0_f32, fade(bg));
+        p.rect_stroke(
+            rect,
+            6.0_f32,
+            egui::Stroke::new(
                 1.0_f32,
-                if active {
-                    egui::Color32::from_rgb(58, 110, 84)
+                fade(if active {
+                    pal.stage_ok
                 } else {
-                    BORDER
-                },
-            ))
-            .corner_radius(6.0_f32),
-        )
+                    egui::Color32::from_white_alpha(71) // rgba(255,255,255,.28)
+                }),
+            ),
+            egui::StrokeKind::Inside,
+        );
+        let icon_rect = egui::Rect::from_center_size(
+            egui::pos2(
+                rect.left() + OVERLAY_PAD_X + OVERLAY_ICON / 2.0,
+                rect.center().y,
+            ),
+            egui::vec2(OVERLAY_ICON, OVERLAY_ICON),
+        );
+        draw_overlay_icon(&p, icon_rect, icon, fade(color));
+        p.galley(
+            egui::pos2(
+                icon_rect.right() + OVERLAY_GAP,
+                rect.center().y - galley.size().y / 2.0,
+            ),
+            galley,
+            fade(color),
+        );
+        if resp.hovered() {
+            ui.ctx().set_cursor_icon(egui::CursorIcon::PointingHand);
+        }
+        resp
     }
 
-    /// 专注模式悬浮控件：小窗态顶部拖动区 + 右上按钮行，5 秒不动自动隐藏。
+    /// 专注模式悬浮控件：小窗态顶部拖动区 + 右上按钮行。
+    ///
+    /// 样式对齐原型 `.focus-exit`（14px 边距、半透明黑底、白色 28% 描边、图标 + 12px 文字）；
+    /// 原型的 `backdrop-filter: blur(4px)` 在 egui 里没有等价物，用同档不透明度代替。
+    /// 指针/滚轮 5 秒不动开始淡出，动一下立即回来；淡到一半就不再接受点击（原型 `.idle`
+    /// 的 `pointer-events: none`）。
     fn draw_focus_overlay(&mut self, ui: &mut egui::Ui, video_rect: egui::Rect) {
+        let pal = self.pal;
         let Some(until) = self.hover_until else {
             return;
         };
-        if Instant::now() >= until {
+        let alpha = ui.ctx().animate_bool_with_time(
+            egui::Id::new("focus_overlay"),
+            Instant::now() < until,
+            OVERLAY_FADE,
+        );
+        if alpha <= 0.01 {
             return;
         }
-        // 提示条只绘制，避免抢占视频的滚轮和双击事件。
+        // 小窗无边框，顶部铺一条拖动提示：只绘制不占事件，和按钮一起淡出。
+        // 用上深下透的渐变而不是实心条，避免在 240px 高的窗口里割出一条硬边。
         if self.view_mode.is_mini() {
-            let top = egui::Rect::from_min_size(
+            let strip = egui::Rect::from_min_size(
                 video_rect.min,
-                egui::vec2((video_rect.width() - OVERLAY_BUTTONS_W).max(0.0), 28.0),
+                egui::vec2(video_rect.width(), OVERLAY_TOP + OVERLAY_BTN_H + 6.0),
             );
-            ui.painter_at(top)
-                .rect_filled(top, 0.0, egui::Color32::from_black_alpha(70));
+            let mut mesh = egui::Mesh::default();
+            mesh.colored_vertex(
+                strip.left_top(),
+                egui::Color32::from_black_alpha(96).gamma_multiply(alpha),
+            );
+            mesh.colored_vertex(
+                strip.right_top(),
+                egui::Color32::from_black_alpha(96).gamma_multiply(alpha),
+            );
+            mesh.colored_vertex(strip.right_bottom(), egui::Color32::TRANSPARENT);
+            mesh.colored_vertex(strip.left_bottom(), egui::Color32::TRANSPARENT);
+            mesh.add_triangle(0, 1, 2);
+            mesh.add_triangle(0, 2, 3);
+            ui.painter_at(strip).add(egui::Shape::mesh(mesh));
         }
-        let top = video_rect.min.y + 4.0;
+        let top = video_rect.min.y + OVERLAY_TOP;
         let row = egui::Rect::from_min_max(
             egui::pos2(video_rect.min.x, top),
-            egui::pos2(video_rect.max.x - 10.0, top + 22.0),
+            egui::pos2(video_rect.max.x - OVERLAY_RIGHT, top + OVERLAY_BTN_H),
         );
         ui.allocate_new_ui(egui::UiBuilder::new().max_rect(row), |ui| {
+            ui.spacing_mut().item_spacing.x = 6.0;
             ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                 let ctx = ui.ctx().clone();
-                if Self::overlay_button(ui, "全屏", is_fullscreen(&ctx)).clicked() {
+                let button = |ui: &mut egui::Ui, icon, text, active| {
+                    Self::overlay_button(ui, &pal, icon, text, active, alpha)
+                };
+                if button(ui, OverlayIcon::Fullscreen, "全屏", is_fullscreen(&ctx)).clicked() {
                     self.toggle_fullscreen(&ctx);
                 }
-                if Self::overlay_button(ui, "小窗", self.view_mode.is_mini()).clicked() {
+                if button(ui, OverlayIcon::Mini, "小窗", self.view_mode.is_mini()).clicked() {
                     self.toggle_mini(&ctx);
                 }
-                if Self::overlay_button(ui, "还原", false).clicked() {
+                if button(ui, OverlayIcon::Restore, "还原", false).clicked() {
                     self.exit_focus(&ctx);
                 }
-                if self.zoom > 1.0 && Self::overlay_button(ui, "复位", false).clicked() {
+                if self.zoom > 1.0 && button(ui, OverlayIcon::Reset, "复位", false).clicked() {
                     self.reset_zoom();
                 }
             });
@@ -1861,8 +2031,9 @@ impl XdView {
     }
 
     fn draw_video(&mut self, ctx: &egui::Context) {
+        let pal = self.pal;
         egui::CentralPanel::default()
-            .frame(egui::Frame::new().fill(BG))
+            .frame(egui::Frame::new().fill(pal.bg))
             .show(ctx, |ui| {
                 let avail = ui.available_size();
                 let bar_h = if self.view_mode.is_focus() { 0.0 } else { 44.0 };
@@ -1878,14 +2049,8 @@ impl XdView {
                 );
                 let painter = ui.painter_at(rect);
 
-                // 舞台底色：中央略亮的径向感（用一层内矩形近似）
-                painter.rect_filled(rect, 0.0_f32, BG);
-                let inner = rect.shrink2(egui::vec2(0.0, 0.0));
-                painter.rect_filled(
-                    inner,
-                    0.0_f32,
-                    egui::Color32::from_rgba_unmultiplied(13, 16, 21, 255),
-                );
+                // 画面层始终是深底：浅色主题只换外围面板，视频区保持原型 .stage 的观感
+                painter.rect_filled(rect, 0.0_f32, pal.stage);
 
                 match (&self.tex, self.frame.as_ref()) {
                     (Some(tex), Some(frame)) => {
@@ -1905,24 +2070,24 @@ impl XdView {
                                 (
                                     format!("正在连接 {name} …"),
                                     "ONVIF GetProfiles → GetStreamUri → RTSP DESCRIBE".to_string(),
-                                    WARN,
+                                    pal.warn,
                                 )
                             }
                             Conn::Failed(e) => (
                                 "连接失败".to_string(),
                                 format!("{e}。将按指数退避自动重连。"),
-                                BAD,
+                                pal.bad,
                             ),
                             // 解码会话已建立但还没到首帧（ffmpeg 预热中）
                             Conn::Live { .. } => (
                                 "已连接，等待首帧…".to_string(),
                                 "首个关键帧到达后自动显示画面".to_string(),
-                                WARN,
+                                pal.warn,
                             ),
                             _ => (
                                 "未连接".to_string(),
                                 "从左侧选择设备开始预览".to_string(),
-                                DIM,
+                                pal.stage_dim,
                             ),
                         };
                         if matches!(self.conn, Conn::Connecting) {
@@ -1933,7 +2098,7 @@ impl XdView {
                             ui.painter_at(rect).circle_stroke(
                                 spin_rect.center(),
                                 13.0_f32,
-                                egui::Stroke::new(2.5_f32, BORDER_STRONG),
+                                egui::Stroke::new(2.5_f32, pal.stage_border),
                             );
                         }
                         painter.text(
@@ -1948,7 +2113,7 @@ impl XdView {
                             egui::Align2::CENTER_CENTER,
                             detail,
                             egui::FontId::monospace(11.0),
-                            FAINT,
+                            pal.stage_faint,
                         );
                     }
                 }
@@ -2019,7 +2184,7 @@ impl XdView {
                                 egui::pos2(hl.center().x, full.min.y),
                                 egui::pos2(hl.center().x, full.max.y),
                             ],
-                            egui::Stroke::new(2.0_f32, egui::Color32::from_rgb(70, 120, 170)),
+                            egui::Stroke::new(2.0_f32, pal.link),
                         );
                     }
                     if rr.hovered() || rr.dragged() {
@@ -2029,7 +2194,7 @@ impl XdView {
                                 egui::pos2(hr.center().x, full.min.y),
                                 egui::pos2(hr.center().x, full.max.y),
                             ],
-                            egui::Stroke::new(2.0_f32, egui::Color32::from_rgb(70, 120, 170)),
+                            egui::Stroke::new(2.0_f32, pal.link),
                         );
                     }
                     if rl.dragged() {
@@ -2048,8 +2213,8 @@ impl XdView {
                         .is_some();
                     let live = matches!(self.conn, Conn::Live { .. } | Conn::Connecting);
                     egui::Frame::new()
-                        .fill(PANEL)
-                        .stroke(egui::Stroke::new(1.0_f32, BORDER))
+                        .fill(pal.panel)
+                        .stroke(egui::Stroke::new(1.0_f32, pal.border))
                         .inner_margin(egui::Margin {
                             left: 18,
                             right: 18,
@@ -2079,7 +2244,7 @@ impl XdView {
                                         }
                                     ))
                                     .size(12.0)
-                                    .color(DIM),
+                                    .color(pal.dim),
                                 );
                                 ui.with_layout(
                                     egui::Layout::right_to_left(egui::Align::Center),
@@ -2091,10 +2256,10 @@ impl XdView {
                                                 egui::Button::new(
                                                     egui::RichText::new("断开").size(12.0),
                                                 )
-                                                .fill(PANEL2)
+                                                .fill(pal.panel2)
                                                 .stroke(egui::Stroke::new(
                                                     1.0_f32,
-                                                    egui::Color32::from_rgb(96, 52, 52),
+                                                    pal.danger_stroke,
                                                 ))
                                                 .corner_radius(6.0_f32),
                                             )
@@ -2104,11 +2269,13 @@ impl XdView {
                                         }
                                         if can_stream_switch {
                                             ui.add_space(10.0);
-                                            if seg_btn(ui, "子码流", !self.high_stream).clicked()
+                                            if seg_btn(ui, &pal, "子码流", !self.high_stream)
+                                                .clicked()
                                             {
                                                 self.set_stream(false);
                                             }
-                                            if seg_btn(ui, "主码流", self.high_stream).clicked()
+                                            if seg_btn(ui, &pal, "主码流", self.high_stream)
+                                                .clicked()
                                             {
                                                 self.set_stream(true);
                                             }
@@ -2141,7 +2308,7 @@ impl XdView {
                                                 egui::Button::new(
                                                     egui::RichText::new("−").size(13.0),
                                                 )
-                                                .fill(PANEL2)
+                                                .fill(pal.panel2)
                                                 .corner_radius(6.0_f32),
                                             )
                                             .clicked()
@@ -2155,7 +2322,7 @@ impl XdView {
                                             ))
                                             .monospace()
                                             .size(11.0)
-                                            .color(DIM),
+                                            .color(pal.dim),
                                         )
                                         .on_hover_text("滚轮缩放 · 拖动平移 · 双击进入专注模式");
                                         if ui
@@ -2163,7 +2330,7 @@ impl XdView {
                                                 egui::Button::new(
                                                     egui::RichText::new("+").size(13.0),
                                                 )
-                                                .fill(PANEL2)
+                                                .fill(pal.panel2)
                                                 .corner_radius(6.0_f32),
                                             )
                                             .clicked()
@@ -2176,7 +2343,7 @@ impl XdView {
                                                 egui::Button::new(
                                                     egui::RichText::new("复位").size(11.0),
                                                 )
-                                                .fill(PANEL2)
+                                                .fill(pal.panel2)
                                                 .corner_radius(6.0_f32),
                                             )
                                             .clicked()
@@ -2200,9 +2367,10 @@ impl XdView {
 
     /// 日志条（原型里位于中央列底部、视频操作条之下）。
     fn draw_log_strip(&mut self, ui: &mut egui::Ui, height: f32) {
+        let pal = self.pal;
         egui::Frame::new()
-            .fill(INSET)
-            .stroke(egui::Stroke::new(1.0_f32, BORDER))
+            .fill(pal.inset)
+            .stroke(egui::Stroke::new(1.0_f32, pal.border))
             .inner_margin(egui::Margin {
                 left: 16,
                 right: 16,
@@ -2212,7 +2380,12 @@ impl XdView {
             .show(ui, |ui| {
                 ui.set_height(height);
                 ui.horizontal(|ui| {
-                    ui.label(egui::RichText::new("日志").size(11.0).strong().color(DIM));
+                    ui.label(
+                        egui::RichText::new("日志")
+                            .size(11.0)
+                            .strong()
+                            .color(pal.dim),
+                    );
                     ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                         if ui
                             .add(
@@ -2243,7 +2416,7 @@ impl XdView {
                                         egui::RichText::new(&line.stamp)
                                             .monospace()
                                             .size(11.0)
-                                            .color(FAINT),
+                                            .color(pal.faint),
                                     )
                                     .truncate(),
                                 );
@@ -2254,7 +2427,7 @@ impl XdView {
                                         egui::RichText::new(line.level.as_str())
                                             .monospace()
                                             .size(11.0)
-                                            .color(line.level.color()),
+                                            .color(line.level.color(&pal)),
                                     )
                                     .truncate(),
                                 );
@@ -2263,7 +2436,7 @@ impl XdView {
                                 ui.add_sized(
                                     egui::vec2(msg_w, 14.0),
                                     egui::Label::new(
-                                        egui::RichText::new(&line.msg).size(11.0).color(MSG),
+                                        egui::RichText::new(&line.msg).size(11.0).color(pal.msg),
                                     )
                                     .truncate(),
                                 );
@@ -2274,13 +2447,14 @@ impl XdView {
     }
 
     fn draw_controls(&mut self, ctx: &egui::Context) {
+        let pal = self.pal;
         egui::SidePanel::right("controls")
             .resizable(false)
             .exact_width(self.right_w)
             .frame(
                 egui::Frame::new()
-                    .fill(PANEL)
-                    .stroke(egui::Stroke::new(1.0_f32, BORDER))
+                    .fill(pal.panel)
+                    .stroke(egui::Stroke::new(1.0_f32, pal.border))
                     .inner_margin(egui::Margin {
                         left: 0,
                         right: 0,
@@ -2304,7 +2478,8 @@ impl XdView {
 
     // ---- 右侧：实时统计 ----
     fn sect_stats(&mut self, ui: &mut egui::Ui) {
-        section(ui, "实时统计", |ui| {
+        let pal = self.pal;
+        section(ui, &pal, "实时统计", |ui| {
             let (res, codec, stream) = match &self.conn {
                 Conn::Live {
                     width,
@@ -2324,9 +2499,16 @@ impl XdView {
             ui.horizontal(|ui| {
                 ui.spacing_mut().item_spacing.x = 0.0;
                 let cw = ((ui.available_width() - 8.0) / 2.0).max(40.0);
-                stat_cell(ui, cw, "帧率", &format!("{:.1} fps", self.stats.fps), OK);
+                stat_cell(
+                    ui,
+                    &pal,
+                    cw,
+                    "帧率",
+                    &format!("{:.1} fps", self.stats.fps),
+                    pal.ok,
+                );
                 ui.add_space(8.0);
-                stat_cell(ui, cw, "分辨率", &res, TEXT);
+                stat_cell(ui, &pal, cw, "分辨率", &res, pal.text);
             });
             ui.add_space(8.0);
             ui.horizontal(|ui| {
@@ -2334,20 +2516,28 @@ impl XdView {
                 let cw = ((ui.available_width() - 8.0) / 2.0).max(40.0);
                 stat_cell(
                     ui,
+                    &pal,
                     cw,
                     "解码吞吐",
                     &format!("{:.0} MB/s", self.stats.mb_per_s),
-                    TEXT,
+                    pal.text,
                 );
                 ui.add_space(8.0);
-                stat_cell(ui, cw, "累计帧", &format!("{}", self.stats.frames), TEXT);
+                stat_cell(
+                    ui,
+                    &pal,
+                    cw,
+                    "累计帧",
+                    &format!("{}", self.stats.frames),
+                    pal.text,
+                );
             });
             ui.add_space(6.0);
             ui.label(
                 egui::RichText::new(format!("{codec} · {stream} · rawvideo → GPU"))
                     .monospace()
                     .size(10.0)
-                    .color(FAINT),
+                    .color(pal.faint),
             );
             if !self.device_info.is_empty() {
                 ui.add_space(2.0);
@@ -2367,6 +2557,7 @@ impl XdView {
 
     // ---- 右侧：云台控制 ----
     fn sect_ptz(&mut self, ui: &mut egui::Ui) {
+        let pal = self.pal;
         let caps = self.current().map(|c| c.capabilities);
         let has_onvif = !self.profiles.is_empty();
         let hint = if !caps.map(|c| c.ptz).unwrap_or(false) {
@@ -2376,13 +2567,13 @@ impl XdView {
         } else {
             "需连接"
         };
-        section(ui, "云台控制", |ui| {
+        section(ui, &pal, "云台控制", |ui| {
             ui.horizontal(|ui| {
                 ui.label(
                     egui::RichText::new(hint)
                         .monospace()
                         .size(10.0)
-                        .color(FAINT),
+                        .color(pal.faint),
                 );
             });
             ui.add_space(6.0);
@@ -2396,7 +2587,7 @@ impl XdView {
                         "该设备未启用云台"
                     })
                     .size(12.0)
-                    .color(DIM),
+                    .color(pal.dim),
                 );
                 return;
             }
@@ -2409,24 +2600,24 @@ impl XdView {
                 ui.vertical(|ui| {
                     ui.horizontal(|ui| {
                         ui.add_space(42.0);
-                        if pad(ui, "↑").is_pointer_button_down_on() {
+                        if pad(ui, &pal, "↑").is_pointer_button_down_on() {
                             want.tilt = speed;
                         }
                     });
                     ui.horizontal(|ui| {
-                        if pad(ui, "←").is_pointer_button_down_on() {
+                        if pad(ui, &pal, "←").is_pointer_button_down_on() {
                             want.pan = -speed;
                         }
-                        if pad(ui, "归位").clicked() {
+                        if pad(ui, &pal, "归位").clicked() {
                             self.ptz_stop();
                         }
-                        if pad(ui, "→").is_pointer_button_down_on() {
+                        if pad(ui, &pal, "→").is_pointer_button_down_on() {
                             want.pan = speed;
                         }
                     });
                     ui.horizontal(|ui| {
                         ui.add_space(42.0);
-                        if pad(ui, "↓").is_pointer_button_down_on() {
+                        if pad(ui, &pal, "↓").is_pointer_button_down_on() {
                             want.tilt = -speed;
                         }
                     });
@@ -2434,14 +2625,14 @@ impl XdView {
 
                 ui.add_space(10.0);
                 ui.vertical(|ui| {
-                    ui.label(egui::RichText::new("变焦").size(10.0).color(FAINT));
+                    ui.label(egui::RichText::new("变焦").size(10.0).color(pal.faint));
                     ui.horizontal(|ui| {
                         if ui
                             .add_sized(
                                 egui::vec2(28.0, 26.0),
                                 egui::Button::new(egui::RichText::new("−").size(14.0))
-                                    .fill(PANEL2)
-                                    .stroke(egui::Stroke::new(1.0_f32, BORDER))
+                                    .fill(pal.panel2)
+                                    .stroke(egui::Stroke::new(1.0_f32, pal.border))
                                     .corner_radius(6.0_f32),
                             )
                             .is_pointer_button_down_on()
@@ -2451,7 +2642,7 @@ impl XdView {
                         let (rect, _) =
                             ui.allocate_exact_size(egui::vec2(48.0, 4.0), egui::Sense::hover());
                         let p = ui.painter_at(rect);
-                        p.rect_filled(rect, 2.0_f32, BORDER);
+                        p.rect_filled(rect, 2.0_f32, pal.border);
                         let frac = (self.velocity.zoom.abs() / 1.0).clamp(0.0, 1.0);
                         if frac > 0.0 {
                             p.rect_filled(
@@ -2460,15 +2651,15 @@ impl XdView {
                                     egui::vec2(rect.width() * frac, 4.0),
                                 ),
                                 2.0_f32,
-                                OK,
+                                pal.ok,
                             );
                         }
                         if ui
                             .add_sized(
                                 egui::vec2(28.0, 26.0),
                                 egui::Button::new(egui::RichText::new("＋").size(14.0))
-                                    .fill(PANEL2)
-                                    .stroke(egui::Stroke::new(1.0_f32, BORDER))
+                                    .fill(pal.panel2)
+                                    .stroke(egui::Stroke::new(1.0_f32, pal.border))
                                     .corner_radius(6.0_f32),
                             )
                             .is_pointer_button_down_on()
@@ -2478,7 +2669,7 @@ impl XdView {
                     });
 
                     ui.add_space(6.0);
-                    ui.label(egui::RichText::new("转动速度").size(10.0).color(FAINT));
+                    ui.label(egui::RichText::new("转动速度").size(10.0).color(pal.faint));
                     egui::ComboBox::from_id_salt("ptz_speed")
                         .selected_text(
                             egui::RichText::new(PTZ_SPEED_NAMES[self.ptz_speed_idx]).size(12.0),
@@ -2523,7 +2714,7 @@ impl XdView {
             ui.label(
                 egui::RichText::new("方向校正（按机型）")
                     .size(10.0)
-                    .color(FAINT),
+                    .color(pal.faint),
             );
             ui.add_space(4.0);
             ui.horizontal(|ui| {
@@ -2531,7 +2722,7 @@ impl XdView {
                     Some(c) => (c.invert_pan, c.invert_tilt),
                     None => (false, false),
                 };
-                if toggle_pill(ui, "左右反向", pan, 88.0) {
+                if toggle_pill(ui, &pal, "左右反向", pan, 88.0) {
                     pan = !pan;
                     if let Some(c) = self.cfg.cameras.get_mut(self.selected) {
                         c.invert_pan = pan;
@@ -2542,7 +2733,7 @@ impl XdView {
                     );
                 }
                 ui.add_space(8.0);
-                if toggle_pill(ui, "上下反向", tilt, 88.0) {
+                if toggle_pill(ui, &pal, "上下反向", tilt, 88.0) {
                     tilt = !tilt;
                     if let Some(c) = self.cfg.cameras.get_mut(self.selected) {
                         c.invert_tilt = tilt;
@@ -2558,18 +2749,19 @@ impl XdView {
 
     // ---- 右侧：预置位 ----
     fn sect_presets(&mut self, ui: &mut egui::Ui) {
+        let pal = self.pal;
         let hint = if self.presets.is_empty() {
             "—".to_string()
         } else {
             format!("{} 个", self.presets.len())
         };
-        section(ui, "预置位", |ui| {
+        section(ui, &pal, "预置位", |ui| {
             ui.horizontal(|ui| {
                 ui.label(
                     egui::RichText::new(hint)
                         .monospace()
                         .size(10.0)
-                        .color(FAINT),
+                        .color(pal.faint),
                 );
             });
             if !self.presets.is_empty() {
@@ -2582,10 +2774,10 @@ impl XdView {
                         ui.horizontal(|ui| {
                             ui.spacing_mut().item_spacing.x = 0.0;
                             let pw = ((ui.available_width() - 6.0) / 2.0).max(40.0);
-                            preset_cell(ui, pw, i, p, &mut goto, &mut remove);
+                            preset_cell(ui, &pal, pw, i, p, &mut goto, &mut remove);
                             ui.add_space(6.0);
                             if let Some(p2) = presets.get(i + 1) {
-                                preset_cell(ui, pw, i + 1, p2, &mut goto, &mut remove);
+                                preset_cell(ui, &pal, pw, i + 1, p2, &mut goto, &mut remove);
                             }
                         });
                         ui.add_space(6.0);
@@ -2616,8 +2808,8 @@ impl XdView {
                     .add_sized(
                         egui::vec2(64.0, 26.0),
                         egui::Button::new(egui::RichText::new("存当前位置").size(11.0))
-                            .fill(PANEL2)
-                            .stroke(egui::Stroke::new(1.0_f32, BORDER))
+                            .fill(pal.panel2)
+                            .stroke(egui::Stroke::new(1.0_f32, pal.border))
                             .corner_radius(6.0_f32),
                     )
                     .clicked()
@@ -2638,25 +2830,26 @@ impl XdView {
             ui.label(
                 egui::RichText::new("点击预置位跳转（GetGotoPreset）；✕ 删除；上方输入名称存当前位置（SetPreset）。")
                     .size(10.0)
-                    .color(FAINT),
+                    .color(pal.faint),
             );
         });
     }
 
     // ---- 右侧：采集 ----
     fn sect_capture(&mut self, ui: &mut egui::Ui) {
-        section(ui, "采集", |ui| {
+        let pal = self.pal;
+        section(ui, &pal, "采集", |ui| {
             let recording = self.recorder.is_some();
             ui.horizontal(|ui| {
                 // item_spacing 会在控件间隐式加 8px，与 add_space 叠加会把行撑出面板被裁切
                 ui.spacing_mut().item_spacing.x = 0.0;
                 let cw = ((ui.available_width() - 8.0) / 2.0).max(40.0);
-                if cap_btn(ui, cw, "截图", "BMP", false).clicked() {
+                if cap_btn(ui, &pal, cw, "截图", "BMP", false).clicked() {
                     self.snapshot();
                 }
                 ui.add_space(8.0);
                 let label = if recording { "停止" } else { "录像" };
-                if cap_btn(ui, cw, label, "MKV · 不重编码", recording).clicked() {
+                if cap_btn(ui, &pal, cw, label, "MKV · 不重编码", recording).clicked() {
                     self.toggle_record();
                 }
             });
@@ -2677,7 +2870,7 @@ impl XdView {
                 ui.label(
                     egui::RichText::new(format!("● REC  {}", fmt_duration(record_secs)))
                         .size(12.0)
-                        .color(BAD),
+                        .color(pal.bad),
                 );
             }
         });
@@ -2685,7 +2878,8 @@ impl XdView {
 
     // ---- 右侧：滚动缓存 ----
     fn sect_cache(&mut self, ui: &mut egui::Ui) {
-        section(ui, "滚动缓存（DVR）", |ui| {
+        let pal = self.pal;
+        section(ui, &pal, "滚动缓存（DVR）", |ui| {
             let on = self.cache_running();
             let mut toggle_clicked = false;
             let row_w = ui.available_width();
@@ -2710,9 +2904,9 @@ impl XdView {
                                     })
                                     .size(12.0)
                                     .color(if on {
-                                        OK
+                                        pal.ok
                                     } else {
-                                        TEXT
+                                        pal.text
                                     }),
                                 )
                                 .truncate(),
@@ -2739,14 +2933,17 @@ impl XdView {
                             ui.add_sized(
                                 egui::vec2(left_w, 14.0),
                                 egui::Label::new(
-                                    egui::RichText::new(sub).monospace().size(10.0).color(FAINT),
+                                    egui::RichText::new(sub)
+                                        .monospace()
+                                        .size(10.0)
+                                        .color(pal.faint),
                                 )
                                 .truncate(),
                             );
                         },
                     );
                     ui.add_space(8.0);
-                    toggle_clicked = toggle_pill(ui, if on { "开" } else { "关" }, on, 48.0);
+                    toggle_clicked = toggle_pill(ui, &pal, if on { "开" } else { "关" }, on, 48.0);
                 },
             );
             if toggle_clicked {
@@ -2757,18 +2954,10 @@ impl XdView {
                 .add_enabled(
                     on,
                     egui::Button::new(egui::RichText::new("导出最近 10 分钟").size(12.0))
-                        .fill(if on {
-                            egui::Color32::from_rgb(24, 46, 36)
-                        } else {
-                            PANEL2
-                        })
+                        .fill(if on { pal.accent_fill } else { pal.panel2 })
                         .stroke(egui::Stroke::new(
                             1.0_f32,
-                            if on {
-                                egui::Color32::from_rgb(58, 110, 84)
-                            } else {
-                                BORDER
-                            },
+                            if on { pal.accent_stroke } else { pal.border },
                         ))
                         .corner_radius(6.0_f32),
                 )
@@ -2781,7 +2970,7 @@ impl XdView {
                 ui.label(
                     egui::RichText::new("缓存进程已退出，重试中…")
                         .size(11.0)
-                        .color(WARN),
+                        .color(pal.warn),
                 );
             }
         });
@@ -2789,6 +2978,7 @@ impl XdView {
 
     /// 设备导入/导出弹窗：文本即 TOML 片段，支持复制带走 / 存盘 / 粘贴合并。
     fn draw_ie_window(&mut self, ctx: &egui::Context) {
+        let pal = self.pal;
         if !self.ie_open {
             return;
         }
@@ -2805,7 +2995,7 @@ impl XdView {
                         "每台设备一段 [[camera]]（格式与 config.toml 相同）。导出内容含明文密码，注意保管。",
                     )
                     .size(11.0)
-                    .color(FAINT),
+                    .color(pal.faint),
                 );
                 ui.add_space(6.0);
                 ui.add(
@@ -2816,7 +3006,7 @@ impl XdView {
                 );
                 if !self.ie_error.is_empty() {
                     ui.add_space(4.0);
-                    ui.label(egui::RichText::new(&self.ie_error).size(11.0).color(BAD));
+                    ui.label(egui::RichText::new(&self.ie_error).size(11.0).color(pal.bad));
                 }
                 ui.add_space(8.0);
                 ui.horizontal(|ui| {
@@ -2844,6 +3034,7 @@ impl XdView {
 
     /// 「添加设备」弹窗：手填 ONVIF 地址/账号（扫描不可用时的正路）。
     fn draw_add_window(&mut self, ctx: &egui::Context) {
+        let pal = self.pal;
         if !self.add_open {
             return;
         }
@@ -2860,11 +3051,11 @@ impl XdView {
                         "扫描找不到设备时手填（小度/TP-Link 等不支持 WS-Discovery）。地址可只写到主机。",
                     )
                     .size(11.0)
-                    .color(FAINT),
+                    .color(pal.faint),
                 );
                 ui.add_space(8.0);
                 ui.horizontal(|ui| {
-                    ui.add_sized([64.0, 20.0], egui::Label::new(egui::RichText::new("名称").size(12.0).color(DIM)));
+                    ui.add_sized([64.0, 20.0], egui::Label::new(egui::RichText::new("名称").size(12.0).color(pal.dim)));
                     ui.add(
                         egui::TextEdit::singleline(&mut self.add_name)
                             .hint_text("可留空，默认用地址")
@@ -2873,7 +3064,7 @@ impl XdView {
                 });
                 ui.add_space(6.0);
                 ui.horizontal(|ui| {
-                    ui.add_sized([64.0, 20.0], egui::Label::new(egui::RichText::new("ONVIF 地址").size(12.0).color(DIM)));
+                    ui.add_sized([64.0, 20.0], egui::Label::new(egui::RichText::new("ONVIF 地址").size(12.0).color(pal.dim)));
                     ui.add(
                         egui::TextEdit::singleline(&mut self.add_url)
                             .hint_text("http://192.168.1.64:8080")
@@ -2883,13 +3074,13 @@ impl XdView {
                 });
                 ui.add_space(6.0);
                 ui.horizontal(|ui| {
-                    ui.add_sized([64.0, 20.0], egui::Label::new(egui::RichText::new("用户名").size(12.0).color(DIM)));
+                    ui.add_sized([64.0, 20.0], egui::Label::new(egui::RichText::new("用户名").size(12.0).color(pal.dim)));
                     ui.add(
                         egui::TextEdit::singleline(&mut self.add_user)
                             .desired_width(130.0),
                     );
                     ui.add_space(10.0);
-                    ui.add_sized([32.0, 20.0], egui::Label::new(egui::RichText::new("密码").size(12.0).color(DIM)));
+                    ui.add_sized([32.0, 20.0], egui::Label::new(egui::RichText::new("密码").size(12.0).color(pal.dim)));
                     ui.add(
                         egui::TextEdit::singleline(&mut self.add_pass)
                             .password(true)
@@ -2898,18 +3089,15 @@ impl XdView {
                 });
                 if !self.add_error.is_empty() {
                     ui.add_space(4.0);
-                    ui.label(egui::RichText::new(&self.add_error).size(11.0).color(BAD));
+                    ui.label(egui::RichText::new(&self.add_error).size(11.0).color(pal.bad));
                 }
                 ui.add_space(10.0);
                 ui.horizontal(|ui| {
                     if ui
                         .add(
                             egui::Button::new(egui::RichText::new("添加并连接").size(12.0))
-                                .fill(egui::Color32::from_rgb(28, 44, 36))
-                                .stroke(egui::Stroke::new(
-                                    1.0_f32,
-                                    egui::Color32::from_rgb(58, 110, 84),
-                                ))
+                                .fill(pal.accent_fill)
+                                .stroke(egui::Stroke::new(1.0_f32, pal.accent_stroke))
                                 .corner_radius(6.0_f32),
                         )
                         .clicked()
@@ -2922,8 +3110,8 @@ impl XdView {
                     if ui
                         .add(
                             egui::Button::new(egui::RichText::new("取消").size(12.0))
-                                .fill(PANEL2)
-                                .stroke(egui::Stroke::new(1.0_f32, BORDER))
+                                .fill(pal.panel2)
+                                .stroke(egui::Stroke::new(1.0_f32, pal.border))
                                 .corner_radius(6.0_f32),
                         )
                         .clicked()
@@ -2938,6 +3126,7 @@ impl XdView {
     }
 
     fn draw_toast(&mut self, ctx: &egui::Context) {
+        let pal = self.pal;
         let Some(until) = self.note_until else {
             return;
         };
@@ -2948,8 +3137,8 @@ impl XdView {
             .anchor(egui::Align2::RIGHT_BOTTOM, egui::vec2(-18.0, -196.0))
             .show(ctx, |ui| {
                 egui::Frame::new()
-                    .fill(egui::Color32::from_rgb(22, 28, 38))
-                    .stroke(egui::Stroke::new(1.0_f32, BORDER_STRONG))
+                    .fill(pal.toast_fill)
+                    .stroke(egui::Stroke::new(1.0_f32, pal.border_strong))
                     .corner_radius(7.0_f32)
                     .inner_margin(egui::Margin {
                         left: 14,
@@ -2959,7 +3148,7 @@ impl XdView {
                     })
                     .show(ui, |ui| {
                         ui.set_max_width(380.0);
-                        ui.label(egui::RichText::new(&self.note).size(12.0).color(TEXT));
+                        ui.label(egui::RichText::new(&self.note).size(12.0).color(pal.text));
                     });
             });
     }
@@ -2967,6 +3156,8 @@ impl XdView {
 
 impl eframe::App for XdView {
     fn update(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
+        let save_failed = self.poll_prefs();
+        self.guard_close(ctx, save_failed);
         if self.autostart {
             self.autostart = false;
             if self.stream.is_none() && !self.cfg.cameras.is_empty() {
@@ -3052,6 +3243,8 @@ impl eframe::App for XdView {
     /// 最后一片的时长元数据就是错的（实测出现过 393s 的假时长）。
     /// 这里显式停掉缓存/录像，让 ffmpeg 把当前片写完整。
     fn on_exit(&mut self, _gl: Option<&eframe::glow::Context>) {
+        // 只置停机标志，不 join：线程收尾不该把阻塞带回退出路径
+        self.prefs.shutdown();
         // 窗口几何退出时写一次独立文件，不覆写 config.toml（保留用户注释与外部编辑）。
         // 专注态尺寸不代表主窗口，只在 Normal / Mini 两态记录。
         let ctx = self.egui_ctx.clone();
@@ -3081,15 +3274,274 @@ impl eframe::App for XdView {
 
 // ---------------------------------------------------------------------------- 绘制小部件
 
-/// 原型的协议小圆片（ONVIF / RTSP · TCP / DVR 缓存）。`active` 为真时高亮。
-fn chip(ui: &mut egui::Ui, text: &str, active: bool) {
-    let (stroke, color) = if active {
-        (
-            egui::Stroke::new(1.0_f32, egui::Color32::from_rgb(58, 110, 84)),
-            DIM,
-        )
+/// 专注态悬浮按钮的图标；原型用内联 SVG，这里用 painter 画同样的形状。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum OverlayIcon {
+    /// 全屏：四角向外撑开
+    Fullscreen,
+    /// 小窗：画中画（外框 + 右下小窗）
+    Mini,
+    /// 还原：四角向中心收，与原型 `.focus-exit` 的路径一致
+    Restore,
+    /// 复位：放大镜减号（数字变焦复位）
+    Reset,
+}
+
+/// 在 `rect`（正方形）里画 13px 图标；坐标按 0..1 归一化，换尺寸不影响形状。
+fn draw_overlay_icon(p: &egui::Painter, rect: egui::Rect, icon: OverlayIcon, color: egui::Color32) {
+    let w = rect.width();
+    let at = |x: f32, y: f32| egui::pos2(rect.min.x + x * w, rect.min.y + y * w);
+    let stroke = egui::Stroke::new(1.4_f32, color);
+    let poly = |pts: &[(f32, f32)]| {
+        let points: Vec<egui::Pos2> = pts.iter().map(|(x, y)| at(*x, *y)).collect();
+        p.add(egui::Shape::line(points, stroke));
+    };
+    match icon {
+        // 原型 path：M8 3v3a2 2… / M21 8h-3… / M3 16h3… / M16 21v-3…（24 视图盒）
+        OverlayIcon::Restore => {
+            poly(&[(0.333, 0.125), (0.333, 0.25), (0.25, 0.333), (0.125, 0.333)]);
+            poly(&[(0.875, 0.333), (0.75, 0.333), (0.667, 0.25), (0.667, 0.125)]);
+            poly(&[(0.125, 0.667), (0.25, 0.667), (0.333, 0.75), (0.333, 0.875)]);
+            poly(&[(0.667, 0.875), (0.667, 0.75), (0.75, 0.667), (0.875, 0.667)]);
+        }
+        OverlayIcon::Fullscreen => {
+            poly(&[(0.125, 0.333), (0.125, 0.125), (0.333, 0.125)]);
+            poly(&[(0.875, 0.333), (0.875, 0.125), (0.667, 0.125)]);
+            poly(&[(0.125, 0.667), (0.125, 0.875), (0.333, 0.875)]);
+            poly(&[(0.875, 0.667), (0.875, 0.875), (0.667, 0.875)]);
+        }
+        // 小窗：左下角一个窗口框 + 右下方向的箭头（「缩到这个窗口」）
+        OverlayIcon::Mini => {
+            p.rect_stroke(
+                egui::Rect::from_min_max(at(0.42, 0.42), at(0.94, 0.94)),
+                1.5_f32,
+                stroke,
+                egui::StrokeKind::Inside,
+            );
+            p.line_segment([at(0.06, 0.06), at(0.36, 0.36)], stroke);
+            p.line_segment([at(0.36, 0.36), at(0.16, 0.36)], stroke);
+            p.line_segment([at(0.36, 0.36), at(0.36, 0.16)], stroke);
+        }
+        OverlayIcon::Reset => {
+            p.circle_stroke(at(0.45, 0.45), w * 0.28, stroke);
+            p.line_segment([at(0.66, 0.66), at(0.92, 0.92)], stroke);
+            p.line_segment([at(0.33, 0.45), at(0.57, 0.45)], stroke);
+        }
+    }
+}
+
+/// 关窗暂缓的判定结果。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum CloseAction {
+    /// 不干预，交给 eframe 正常关闭
+    Pass,
+    /// 取消这次关闭，等最后一次偏好写回来
+    Defer,
+    /// 已在暂缓中，继续等
+    Wait,
+    /// 主动关闭：写完了，或者已经等够 `CLOSE_DEFER_MAX`
+    CloseNow,
+    /// 写入失败时留在窗口，让用户看到提示。
+    ShowFailure,
+}
+
+/// 过期回执不能更改待写状态或触发错误提示。
+fn take_latest_save(pending: &mut Option<u64>, saved: Saved) -> Option<Saved> {
+    if *pending != Some(saved.seq) {
+        return None;
+    }
+    *pending = None;
+    Some(saved)
+}
+
+fn close_action_after_save(
+    requested: bool,
+    pending: bool,
+    deadline: Option<Instant>,
+    now: Instant,
+    save_failed: bool,
+) -> CloseAction {
+    if save_failed && (requested || deadline.is_some()) {
+        CloseAction::ShowFailure
     } else {
-        (egui::Stroke::new(1.0_f32, BORDER), FAINT)
+        close_action(requested, pending, deadline, now)
+    }
+}
+
+/// 更新关窗等待状态，视口命令由调用方按返回值发送。
+fn advance_close(
+    deadline: &mut Option<Instant>,
+    requested: bool,
+    pending: bool,
+    now: Instant,
+    save_failed: bool,
+) -> CloseAction {
+    let action = close_action_after_save(requested, pending, *deadline, now, save_failed);
+    match action {
+        CloseAction::Defer => *deadline = Some(now + CLOSE_DEFER_MAX),
+        CloseAction::ShowFailure => *deadline = None,
+        // Close 会在下一帧变成关闭请求；保留截止时间，让该请求直接放行。
+        CloseAction::CloseNow | CloseAction::Pass | CloseAction::Wait => {}
+    }
+    action
+}
+
+/// 关闭请求的状态机（纯函数，便于确定性测试）。
+///
+/// 三条护栏：只在「确实有未落盘的写」时暂缓；暂缓期上限由调用方给的 `deadline` 决定；
+/// 暂缓期间再次点关闭视为坚持要关，直接放行。超时后主动发 `Close`——因为 `CancelClose`
+/// 已经把用户那次点击消费掉了，不主动关闭窗口就会一直开着。
+fn close_action(
+    close_requested: bool,
+    pending: bool,
+    deadline: Option<Instant>,
+    now: Instant,
+) -> CloseAction {
+    if close_requested {
+        return if pending && deadline.is_none() {
+            CloseAction::Defer
+        } else {
+            CloseAction::Pass
+        };
+    }
+    let Some(deadline) = deadline else {
+        return CloseAction::Pass;
+    };
+    if !pending || now >= deadline {
+        CloseAction::CloseNow
+    } else {
+        CloseAction::Wait
+    }
+}
+
+/// 把主题写进 egui：两套样式都登记，再固定主题偏好。
+///
+/// egui 0.31 的 `set_visuals` 只写「当前」主题那一份样式，而当前主题默认跟随系统；
+/// 系统运行中切到深色时，egui 会拿默认深色样式把我们的色板顶掉。
+/// 两套都写 + 显式 `set_theme`，界面主题就只由这里的 `Theme` 决定。
+fn apply_theme(ctx: &egui::Context, theme: Theme) {
+    ctx.set_visuals_of(
+        egui::Theme::Dark,
+        crate::theme::build_visuals(&Palette::dark()),
+    );
+    ctx.set_visuals_of(
+        egui::Theme::Light,
+        crate::theme::build_visuals(&Palette::light()),
+    );
+    ctx.set_theme(if theme.is_light() {
+        egui::ThemePreference::Light
+    } else {
+        egui::ThemePreference::Dark
+    });
+}
+
+/// 主题切换按钮：原型顶栏那个 30×30 的方钮，夜间显示月亮、日间显示太阳。
+///
+/// 图标用 painter 画而不是贴字符：`☾`/`☀` 在中文字体里不一定有字形，
+/// 缺字会变成方块。形状本身也很简单（圆 + 光芒 / 挖角圆）。
+fn theme_button(ui: &mut egui::Ui, pal: &Palette, light: bool) -> egui::Response {
+    let backdrop = pal.panel2;
+    topbar_button(
+        ui,
+        pal,
+        None,
+        "切换日间 / 夜间模式",
+        |p, rect, fg| {
+            let c = rect.center();
+            let w = rect.width();
+            if light {
+                // 日间：圆 + 八道光芒（原型 sun 图标：r=4、光芒 6→8，24 视图盒）
+                p.circle_stroke(c, w * 0.167, egui::Stroke::new(w * 0.083, fg));
+                for i in 0..8 {
+                    let a = i as f32 * std::f32::consts::TAU / 8.0;
+                    let dir = egui::vec2(a.cos(), a.sin());
+                    p.line_segment(
+                        [c + dir * w * 0.25, c + dir * w * 0.333],
+                        egui::Stroke::new(w * 0.083, fg),
+                    );
+                }
+            } else {
+                // 夜间：实心圆挖掉偏右上的一块就是月牙（底是纯色 panel2，挖角可靠）
+                p.circle_filled(c + egui::vec2(-w * 0.05, -w * 0.03), w * 0.46, fg);
+                p.circle_filled(c + egui::vec2(w * 0.24, -w * 0.24), w * 0.41, backdrop);
+            }
+        },
+    )
+}
+
+/// 顶栏按钮（原型 `.theme-btn` / `.theme-btn.wide`）：30 高、`panel2` 底、1px 描边、
+/// 6px 圆角；悬停只换文字与描边颜色，底色不变。没给 `label` 时是 30×30 的方形图标钮，
+/// 给了就按 `padding 0 10px` + `gap 6px` 排成宽钮（专注）。
+fn topbar_button(
+    ui: &mut egui::Ui,
+    pal: &Palette,
+    label: Option<&str>,
+    tip: &str,
+    paint_icon: impl FnOnce(&egui::Painter, egui::Rect, egui::Color32),
+) -> egui::Response {
+    const ICON: f32 = 15.0;
+    const PAD: f32 = 10.0;
+    const GAP: f32 = 6.0;
+    let galley = label.map(|text| {
+        ui.painter().layout_no_wrap(
+            text.to_owned(),
+            egui::FontId::proportional(12.0),
+            egui::Color32::PLACEHOLDER,
+        )
+    });
+    let width = match &galley {
+        Some(g) => PAD * 2.0 + ICON + GAP + g.size().x,
+        None => 30.0,
+    };
+    let (rect, resp) = ui.allocate_exact_size(egui::vec2(width, 30.0), egui::Sense::click());
+    let hovered = resp.hovered();
+    let fg = if hovered { pal.text } else { pal.dim };
+    let p = ui.painter_at(rect);
+    p.rect_filled(rect, 6.0_f32, pal.panel2);
+    p.rect_stroke(
+        rect,
+        6.0_f32,
+        egui::Stroke::new(
+            1.0_f32,
+            if hovered {
+                pal.border_strong
+            } else {
+                pal.border
+            },
+        ),
+        egui::StrokeKind::Inside,
+    );
+    let icon_rect = egui::Rect::from_center_size(
+        egui::pos2(
+            if galley.is_some() {
+                rect.left() + PAD + ICON / 2.0
+            } else {
+                rect.center().x
+            },
+            rect.center().y,
+        ),
+        egui::vec2(ICON, ICON),
+    );
+    paint_icon(&p, icon_rect, fg);
+    if let Some(g) = galley {
+        p.galley(
+            egui::pos2(icon_rect.right() + GAP, rect.center().y - g.size().y / 2.0),
+            g,
+            fg,
+        );
+    }
+    if hovered {
+        ui.ctx().set_cursor_icon(egui::CursorIcon::PointingHand);
+    }
+    resp.on_hover_text(tip)
+}
+
+/// 原型的协议小圆片（ONVIF / RTSP · TCP / DVR 缓存）。`active` 为真时高亮。
+fn chip(ui: &mut egui::Ui, pal: &Palette, text: &str, active: bool) {
+    let (stroke, color) = if active {
+        (egui::Stroke::new(1.0_f32, pal.accent_stroke), pal.dim)
+    } else {
+        (egui::Stroke::new(1.0_f32, pal.border), pal.faint)
     };
     egui::Frame::new()
         .fill(egui::Color32::TRANSPARENT)
@@ -3128,9 +3580,9 @@ fn tag(ui: &mut egui::Ui, text: &str, color: egui::Color32) {
 }
 
 /// 右侧区块：标题 + 分隔 + 内容。
-fn section<R>(ui: &mut egui::Ui, title: &str, add: impl FnOnce(&mut egui::Ui) -> R) {
+fn section<R>(ui: &mut egui::Ui, pal: &Palette, title: &str, add: impl FnOnce(&mut egui::Ui) -> R) {
     egui::Frame::new()
-        .stroke(egui::Stroke::new(1.0_f32, BORDER))
+        .stroke(egui::Stroke::new(1.0_f32, pal.border))
         .inner_margin(egui::Margin {
             left: 16,
             right: 16,
@@ -3138,17 +3590,29 @@ fn section<R>(ui: &mut egui::Ui, title: &str, add: impl FnOnce(&mut egui::Ui) ->
             bottom: 15,
         })
         .show(ui, |ui| {
-            ui.label(egui::RichText::new(title).size(11.0).strong().color(DIM));
+            ui.label(
+                egui::RichText::new(title)
+                    .size(11.0)
+                    .strong()
+                    .color(pal.dim),
+            );
             ui.add_space(10.0);
             add(ui);
         });
 }
 
 /// 统计小格子（原型的 stat-cell）。
-fn stat_cell(ui: &mut egui::Ui, width: f32, key: &str, val: &str, color: egui::Color32) {
+fn stat_cell(
+    ui: &mut egui::Ui,
+    pal: &Palette,
+    width: f32,
+    key: &str,
+    val: &str,
+    color: egui::Color32,
+) {
     egui::Frame::new()
-        .fill(PANEL2)
-        .stroke(egui::Stroke::new(1.0_f32, BORDER))
+        .fill(pal.panel2)
+        .stroke(egui::Stroke::new(1.0_f32, pal.border))
         .corner_radius(6.0_f32)
         .inner_margin(egui::Margin {
             left: 10,
@@ -3158,41 +3622,37 @@ fn stat_cell(ui: &mut egui::Ui, width: f32, key: &str, val: &str, color: egui::C
         })
         .show(ui, |ui| {
             ui.set_min_width(width - 20.0);
-            ui.label(egui::RichText::new(key).size(10.0).color(FAINT));
+            ui.label(egui::RichText::new(key).size(10.0).color(pal.faint));
             ui.add_space(2.0);
             ui.label(egui::RichText::new(val).monospace().size(15.0).color(color));
         });
 }
 
 /// 云台方向键。
-fn pad(ui: &mut egui::Ui, label: &str) -> egui::Response {
+fn pad(ui: &mut egui::Ui, pal: &Palette, label: &str) -> egui::Response {
     ui.add_sized(
         egui::vec2(38.0, 28.0),
         egui::Button::new(egui::RichText::new(label).size(13.0))
-            .fill(PANEL2)
-            .stroke(egui::Stroke::new(1.0_f32, BORDER))
+            .fill(pal.panel2)
+            .stroke(egui::Stroke::new(1.0_f32, pal.border))
             .corner_radius(6.0_f32),
     )
 }
 
 /// 开关小药丸（左右反向 / 缓存开·关）。
-fn toggle_pill(ui: &mut egui::Ui, label: &str, on: bool, width: f32) -> bool {
-    let bg = if on {
-        egui::Color32::from_rgb(30, 58, 44)
-    } else {
-        PANEL2
-    };
+fn toggle_pill(ui: &mut egui::Ui, pal: &Palette, label: &str, on: bool, width: f32) -> bool {
+    let bg = if on { pal.accent_fill } else { pal.panel2 };
     let stroke = if on {
-        egui::Stroke::new(1.0_f32, egui::Color32::from_rgb(58, 110, 84))
+        egui::Stroke::new(1.0_f32, pal.accent_stroke)
     } else {
-        egui::Stroke::new(1.0_f32, BORDER)
+        egui::Stroke::new(1.0_f32, pal.border)
     };
     let resp = ui.add_sized(
         egui::vec2(width, 26.0),
         egui::Button::new(
             egui::RichText::new(format!("{}  {}", if on { "●" } else { "○" }, label))
                 .size(11.0)
-                .color(if on { OK } else { DIM }),
+                .color(if on { pal.ok } else { pal.dim }),
         )
         .fill(bg)
         .stroke(stroke)
@@ -3204,6 +3664,7 @@ fn toggle_pill(ui: &mut egui::Ui, label: &str, on: bool, width: f32) -> bool {
 /// 预置位格子：跳转按钮 + 删除按钮（等宽排布）。
 fn preset_cell(
     ui: &mut egui::Ui,
+    pal: &Palette,
     width: f32,
     idx: usize,
     p: &Preset,
@@ -3215,8 +3676,8 @@ fn preset_cell(
         .add_sized(
             egui::vec2(width - 30.0, 28.0),
             egui::Button::new(egui::RichText::new(label).size(11.0))
-                .fill(PANEL2)
-                .stroke(egui::Stroke::new(1.0_f32, BORDER))
+                .fill(pal.panel2)
+                .stroke(egui::Stroke::new(1.0_f32, pal.border))
                 .corner_radius(6.0_f32),
         )
         .clicked()
@@ -3228,8 +3689,8 @@ fn preset_cell(
         .add_sized(
             egui::vec2(26.0, 28.0),
             egui::Button::new(egui::RichText::new("✕").size(11.0))
-                .fill(PANEL2)
-                .stroke(egui::Stroke::new(1.0_f32, BORDER))
+                .fill(pal.panel2)
+                .stroke(egui::Stroke::new(1.0_f32, pal.border))
                 .corner_radius(6.0_f32),
         )
         .clicked()
@@ -3242,15 +3703,22 @@ fn preset_cell(
 ///
 /// 用 allocate_exact_size 固定宽度：此前用 Frame + vertical_centered 会被
 /// 居中布局的 min_rect 撑满整行，拖宽右侧面板（宽度反馈回路）。
-fn cap_btn(ui: &mut egui::Ui, width: f32, label: &str, sub: &str, hot: bool) -> egui::Response {
+fn cap_btn(
+    ui: &mut egui::Ui,
+    pal: &Palette,
+    width: f32,
+    label: &str,
+    sub: &str,
+    hot: bool,
+) -> egui::Response {
     let (fill, stroke, color) = if hot {
         (
-            egui::Color32::from_rgb(48, 26, 26),
-            egui::Stroke::new(1.0_f32, egui::Color32::from_rgb(120, 60, 60)),
-            BAD,
+            pal.danger_fill,
+            egui::Stroke::new(1.0_f32, pal.danger_stroke),
+            pal.bad,
         )
     } else {
-        (PANEL2, egui::Stroke::new(1.0_f32, BORDER), DIM)
+        (pal.panel2, egui::Stroke::new(1.0_f32, pal.border), pal.dim)
     };
     let (rect, resp) = ui.allocate_exact_size(egui::vec2(width, 56.0), egui::Sense::click());
     let p = ui.painter_at(rect);
@@ -3269,7 +3737,7 @@ fn cap_btn(ui: &mut egui::Ui, width: f32, label: &str, sub: &str, hot: bool) -> 
         egui::Align2::CENTER_CENTER,
         sub,
         egui::FontId::monospace(9.0),
-        FAINT,
+        pal.faint,
     );
     if resp.hovered() {
         ui.ctx().set_cursor_icon(egui::CursorIcon::PointingHand);
@@ -3278,15 +3746,15 @@ fn cap_btn(ui: &mut egui::Ui, width: f32, label: &str, sub: &str, hot: bool) -> 
 }
 
 /// 分段按钮（主码流 / 子码流）。
-fn seg_btn(ui: &mut egui::Ui, label: &str, on: bool) -> egui::Response {
+fn seg_btn(ui: &mut egui::Ui, pal: &Palette, label: &str, on: bool) -> egui::Response {
     let (fill, stroke, color) = if on {
         (
-            egui::Color32::from_rgb(22, 43, 34),
-            egui::Stroke::new(1.0_f32, egui::Color32::from_rgb(58, 110, 84)),
-            OK,
+            pal.accent_fill,
+            egui::Stroke::new(1.0_f32, pal.accent_stroke),
+            pal.ok,
         )
     } else {
-        (PANEL2, egui::Stroke::new(1.0_f32, BORDER), DIM)
+        (pal.panel2, egui::Stroke::new(1.0_f32, pal.border), pal.dim)
     };
     ui.add(
         egui::Button::new(egui::RichText::new(label).size(11.0).color(color))
@@ -3400,42 +3868,106 @@ fn local_bias_minutes() -> i32 {
     0
 }
 
-/// 深色面板视觉（色板见文件顶部常量）。
-fn build_visuals() -> egui::Visuals {
-    let mut v = egui::Visuals::dark();
-    v.panel_fill = PANEL;
-    v.window_fill = PANEL;
-    v.extreme_bg_color = INSET;
-    v.faint_bg_color = PANEL2;
-    v.override_text_color = Some(TEXT);
-    v.selection.bg_fill = egui::Color32::from_rgb(30, 58, 44);
-    v.selection.stroke = egui::Stroke::new(1.0_f32, OK);
-    v.window_corner_radius = egui::CornerRadius::same(8);
-    v.widgets.noninteractive.bg_fill = PANEL2;
-    v.widgets.noninteractive.bg_stroke = egui::Stroke::new(1.0_f32, BORDER);
-    v.widgets.noninteractive.fg_stroke = egui::Stroke::new(1.0_f32, DIM);
-    v.widgets.noninteractive.corner_radius = egui::CornerRadius::same(6);
-    v.widgets.inactive.bg_fill = PANEL2;
-    v.widgets.inactive.weak_bg_fill = PANEL2;
-    v.widgets.inactive.bg_stroke = egui::Stroke::new(1.0_f32, BORDER);
-    v.widgets.inactive.fg_stroke = egui::Stroke::new(1.0_f32, TEXT);
-    v.widgets.inactive.corner_radius = egui::CornerRadius::same(6);
-    v.widgets.hovered.bg_fill = egui::Color32::from_rgb(26, 32, 43);
-    v.widgets.hovered.weak_bg_fill = egui::Color32::from_rgb(26, 32, 43);
-    v.widgets.hovered.bg_stroke = egui::Stroke::new(1.0_f32, BORDER_STRONG);
-    v.widgets.hovered.fg_stroke = egui::Stroke::new(1.0_f32, TEXT);
-    v.widgets.hovered.corner_radius = egui::CornerRadius::same(6);
-    v.widgets.active.bg_fill = egui::Color32::from_rgb(30, 58, 44);
-    v.widgets.active.weak_bg_fill = egui::Color32::from_rgb(30, 58, 44);
-    v.widgets.active.bg_stroke = egui::Stroke::new(1.0_f32, OK);
-    v.widgets.active.fg_stroke = egui::Stroke::new(1.0_f32, TEXT);
-    v.widgets.active.corner_radius = egui::CornerRadius::same(6);
-    v
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn timeout_close_request_is_not_deferred_again() {
+        let start = Instant::now();
+        let mut deadline = None;
+        assert_eq!(
+            advance_close(&mut deadline, true, true, start, false),
+            CloseAction::Defer
+        );
+        let expired = start + CLOSE_DEFER_MAX;
+        assert_eq!(
+            advance_close(&mut deadline, false, true, expired, false),
+            CloseAction::CloseNow
+        );
+        // egui 将 Close 转换成下一帧的关闭请求，写入仍可能阻塞。
+        assert_eq!(
+            advance_close(&mut deadline, true, true, expired, false),
+            CloseAction::Pass
+        );
+    }
+
+    #[test]
+    fn save_result_completes_or_cancels_close_wait() {
+        let start = Instant::now();
+        let mut deadline = None;
+        assert_eq!(
+            advance_close(&mut deadline, true, true, start, false),
+            CloseAction::Defer
+        );
+        assert_eq!(
+            advance_close(&mut deadline, false, false, start, false),
+            CloseAction::CloseNow
+        );
+        assert_eq!(
+            advance_close(&mut deadline, true, false, start, false),
+            CloseAction::Pass
+        );
+
+        let mut deadline = None;
+        assert_eq!(
+            advance_close(&mut deadline, true, true, start, false),
+            CloseAction::Defer
+        );
+        assert_eq!(
+            advance_close(&mut deadline, false, false, start, true),
+            CloseAction::ShowFailure
+        );
+        assert_eq!(deadline, None);
+        assert_eq!(
+            advance_close(&mut deadline, true, false, start, false),
+            CloseAction::Pass
+        );
+    }
+
+    #[test]
+    fn outdated_save_failure_does_not_override_latest_success() {
+        let mut pending = Some(2);
+        let stale = Saved {
+            seq: 1,
+            theme: Theme::Light,
+            result: Err("旧写入失败".into()),
+        };
+        assert!(take_latest_save(&mut pending, stale).is_none());
+        assert_eq!(pending, Some(2));
+        let current = Saved {
+            seq: 2,
+            theme: Theme::Dark,
+            result: Ok(()),
+        };
+        assert!(take_latest_save(&mut pending, current)
+            .unwrap()
+            .result
+            .is_ok());
+        assert_eq!(pending, None);
+    }
+
+    #[test]
+    fn failed_save_keeps_closing_window_open_until_user_retries() {
+        let now = Instant::now();
+        let deadline = Some(now + CLOSE_DEFER_MAX);
+        assert_eq!(
+            close_action_after_save(false, false, deadline, now, true),
+            CloseAction::ShowFailure
+        );
+        assert_eq!(
+            close_action_after_save(true, false, None, now, true),
+            CloseAction::ShowFailure
+        );
+        assert_eq!(
+            close_action_after_save(true, false, None, now, false),
+            CloseAction::Pass
+        );
+        assert_eq!(
+            close_action_after_save(false, false, deadline, now, false),
+            CloseAction::CloseNow
+        );
+    }
 
     #[test]
     fn normal_geometry_survives_maximize_and_minimize() {
@@ -3474,6 +4006,47 @@ mod tests {
         viewport.inner_rect = None;
         remember_geom(&mut geom, GeomSlot::Win, &viewport);
         assert_eq!(geom.win, normal);
+    }
+
+    #[test]
+    fn close_guard_only_defers_a_really_pending_write() {
+        let t0 = Instant::now();
+        let deadline = t0 + CLOSE_DEFER_MAX;
+        // 没有写要等：任何情况下都正常关闭
+        assert_eq!(close_action(false, false, None, t0), CloseAction::Pass);
+        assert_eq!(close_action(true, false, None, t0), CloseAction::Pass);
+        // 有写没落盘：暂缓
+        assert_eq!(close_action(true, true, None, t0), CloseAction::Defer);
+        // 暂缓期间再点一次关闭：放行，不能让人以为窗口关不掉
+        assert_eq!(
+            close_action(true, true, Some(deadline), t0),
+            CloseAction::Pass
+        );
+        // 等待中：还没写完就继续等，写完立刻关
+        assert_eq!(
+            close_action(false, true, Some(deadline), t0),
+            CloseAction::Wait
+        );
+        assert_eq!(
+            close_action(false, false, Some(deadline), t0),
+            CloseAction::CloseNow
+        );
+        // 超时：无论写没写回来都关
+        assert_eq!(
+            close_action(false, true, Some(deadline), deadline),
+            CloseAction::CloseNow
+        );
+        assert_eq!(
+            close_action(
+                false,
+                true,
+                Some(deadline),
+                deadline + Duration::from_millis(1)
+            ),
+            CloseAction::CloseNow
+        );
+        // 没有暂缓在前，后续帧不该主动发 Close
+        assert_eq!(close_action(false, true, None, t0), CloseAction::Pass);
     }
 
     #[test]
