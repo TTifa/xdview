@@ -76,6 +76,9 @@ fn main() {
                 );
             }
             Some(Event::Status(s)) => println!("[ffmpeg] {s}"),
+            Some(Event::Interrupted { retrying }) => {
+                println!("[中断] 自动重连：{}", if retrying { "是" } else { "否" });
+            }
             Some(Event::Failed(e)) => {
                 eprintln!("[失败] {e}");
                 break;

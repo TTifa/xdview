@@ -34,8 +34,17 @@
 **数据流**：`ffprobe` 探测尺寸/编码 → 计算目标尺寸 → `ffmpeg -i <url> -f rawvideo -pix_fmt rgba -`
 输出到 stdout → 读线程按 `w*h*4` 精确读帧 → `Frame` 经 mpsc（容量 4，满了丢帧）→ UI 上传 GPU 纹理。
 
+预览暂停由 app.rs 的 `Preview` 管理：继续消费帧与更新解码统计，但不替换显示帧或上传纹理，
+不积压暂停期间的视频；继续后显示新到帧。截图取显示帧，录像与缓存保持独立运行。
+主动切换设备、码流、清晰度或断开时清空预览与暂停状态；被动断流保留定格帧并显示非实时提示。
+继续预览、媒体中断或再次 `Opened` 后，显示帧在实际替换之前均标记为非实时；`Opened` 只表示解码进程启动。
+`stream::Event::Interrupted { retrying }` 明确通知中断。Opened、Interrupted、Failed、Closed 按序投递，
+队列满时在后台等待并响应取消；帧和日志仍可丢弃。停止路径不依赖 UI 排空队列。
+
 **控制流**：UI 只发 `Command`（Move/Stop/GotoPreset/…），`control.rs` 的后台线程负责
 SOAP 往返，结果以 `Feedback` 回传，全程不阻塞界面。
+ONVIF 的 `ConnectFailed.resolve_stream` 保留原请求的取流依赖；只有依赖 ONVIF 地址且媒体尚未启动的连接
+才因该失败转为预览失败。已有 RTSP 地址或媒体已启动时，只报告控制侧错误；回执仍按设备会话过滤。
 
 运行数据路径由 xd-app 的 storage.rs 统一解析；默认根目录与启动/项目目录分离，自定义相对路径以配置文件目录为基准。具体规则见 [配置参考](CONFIGURATION.md#运行数据目录)。
 

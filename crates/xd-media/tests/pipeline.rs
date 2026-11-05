@@ -7,6 +7,66 @@ use std::process::Command;
 use std::time::{Duration, Instant};
 use xd_media::stream::{Event, Stream, StreamOptions};
 
+/// 用本地单帧图像制造确定性的 EOF，验证中断、重开、首帧的实际事件顺序。
+#[test]
+#[ignore = "需要本机安装 ffmpeg"]
+fn reconnect_reports_interruption_before_next_opened_and_frame() {
+    let dir = std::env::temp_dir().join(format!("xdview-reconnect-{}", std::process::id()));
+    std::fs::create_dir_all(&dir).unwrap();
+    let image = dir.join("source.bmp");
+    let frame = xd_media::Frame {
+        width: 32,
+        height: 24,
+        rgba: vec![255; 32 * 24 * 4],
+        seq: 0,
+        captured_ms: 0,
+    };
+    std::fs::write(&image, frame.to_bmp()).unwrap();
+    let mut opts = StreamOptions::new(image.to_string_lossy(), "ffmpeg");
+    opts.max_width = 32;
+    opts.net.hwaccel = false;
+    let mut stream = Stream::start(opts);
+    let deadline = Instant::now() + Duration::from_secs(20);
+    let mut opens = 0;
+    let mut first_frame = false;
+    let mut interrupted = false;
+    let mut recovered = false;
+    while Instant::now() < deadline {
+        match stream.recv_timeout(Duration::from_millis(200)) {
+            Some(Event::Opened { .. }) => {
+                opens += 1;
+                if opens > 1 {
+                    assert!(interrupted, "重开之前必须通知流中断");
+                }
+            }
+            Some(Event::Frame(f)) => {
+                assert_eq!((f.width, f.height), (32, 24));
+                if opens == 1 {
+                    first_frame = true;
+                }
+                if opens > 1 {
+                    recovered = true;
+                    break;
+                }
+            }
+            Some(Event::Interrupted { retrying }) => {
+                assert!(retrying);
+                assert!(first_frame, "应先出帧再通知中断");
+                interrupted = true;
+            }
+            Some(Event::Failed(e)) => panic!("本地图片解码失败：{e}"),
+            Some(Event::Closed) => break,
+            _ => {}
+        }
+    }
+    stream.stop();
+    assert!(
+        recovered,
+        "应在期限内按 Opened → Frame → Interrupted → Opened → Frame 恢复"
+    );
+    std::fs::remove_dir_all(&dir).unwrap();
+}
+
 #[test]
 #[ignore = "需要本机安装 ffmpeg"]
 fn decodes_generated_video() {
@@ -67,6 +127,7 @@ fn decodes_generated_video() {
             Some(Event::Failed(e)) => panic!("拉流失败: {e}"),
             Some(Event::Closed) => break,
             Some(Event::Status(s)) => println!("status: {s}"),
+            Some(Event::Interrupted { .. }) => break,
             None => {}
         }
     }

@@ -90,7 +90,19 @@ pub enum Feedback {
     Presets(Session, Vec<Preset>),
     /// 成功类的异步回执（如预置位保存/删除）
     Notice(Session, String),
-    /// 错误。`session` 为 `None` 表示与具体设备无关（例如扫描失败）。
+    /// 连接失败：设备在列表里，但 ONVIF 鉴权或取流地址失败。
+    /// 与 [`Self::Error`] 区分开，UI 才能把「连接中」改成失败态。
+    ConnectFailed {
+        session: Session,
+        /// 原连接请求是否依赖 ONVIF 获取媒体地址；为 false 时失败只影响控制能力。
+        resolve_stream: bool,
+        message: String,
+    },
+    /// 扫描失败（与具体设备无关）。UI 据此结束「扫描中」并显示原因。
+    ScanFailed {
+        message: String,
+    },
+    /// 云台等设备命令出错：只记日志，不影响连接状态。
     Error {
         session: Option<Session>,
         message: String,
@@ -101,9 +113,12 @@ impl Feedback {
     /// 回执所属会话。`None` 表示全局回执（扫描结果/扫描失败），总是有效。
     pub fn session(&self) -> Option<&Session> {
         match self {
-            Feedback::Devices(_) | Feedback::Error { session: None, .. } => None,
+            Feedback::Devices(_)
+            | Feedback::ScanFailed { .. }
+            | Feedback::Error { session: None, .. } => None,
             Feedback::Connected { session, .. }
             | Feedback::StreamUri { session, .. }
+            | Feedback::ConnectFailed { session, .. }
             | Feedback::Presets(session, _)
             | Feedback::Notice(session, _) => Some(session),
             Feedback::Error {
@@ -295,14 +310,12 @@ impl Worker {
                         let _ = tx.send(Feedback::Devices(list));
                     }
                     Ok(Err(())) => {
-                        let _ = tx.send(Feedback::Error {
-                            session: None,
+                        let _ = tx.send(Feedback::ScanFailed {
                             message: "扫描失败：WS-Discovery 无应答，网段探测也未命中".into(),
                         });
                     }
                     Err(_) => {
-                        let _ = tx.send(Feedback::Error {
-                            session: None,
+                        let _ = tx.send(Feedback::ScanFailed {
                             message: "扫描线程异常退出".into(),
                         });
                     }
@@ -332,8 +345,9 @@ impl Worker {
                                         });
                                     }
                                     Err(e) => {
-                                        let _ = tx.send(Feedback::Error {
-                                            session: Some(session.clone()),
+                                        let _ = tx.send(Feedback::ConnectFailed {
+                                            session: session.clone(),
+                                            resolve_stream,
                                             message: format!("取流地址失败: {e}"),
                                         });
                                     }
@@ -349,8 +363,9 @@ impl Worker {
                     }
                     Err(e) => {
                         self.clear();
-                        let _ = tx.send(Feedback::Error {
-                            session: Some(session),
+                        let _ = tx.send(Feedback::ConnectFailed {
+                            session,
+                            resolve_stream,
                             message: format!("ONVIF 连接失败: {e}"),
                         });
                     }
@@ -498,6 +513,33 @@ fn run_discover(timeout_ms: u64) -> Result<Vec<DiscoveredDevice>, ()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// 回执的会话归属决定 UI 是否丢弃：连接失败必须带会话（否则迟到回执会串台），
+    /// 扫描失败必须为 None（否则会被当作别的设备的回执直接丢掉）。
+    #[test]
+    fn feedback_session_routing() {
+        let s = Session {
+            camera_id: "cam-a".into(),
+            generation: 1,
+        };
+        assert_eq!(
+            Feedback::ConnectFailed {
+                session: s.clone(),
+                resolve_stream: true,
+                message: "ONVIF 连接失败".into()
+            }
+            .session(),
+            Some(&s)
+        );
+        assert_eq!(
+            Feedback::ScanFailed {
+                message: "x".into()
+            }
+            .session(),
+            None
+        );
+        assert_eq!(Feedback::Devices(Vec::new()).session(), None);
+    }
 
     #[test]
     fn revoke_bumps_generation() {

@@ -20,15 +20,19 @@ const BENIGN_DECODER_NOISE: &[&str] = &[
 
 #[derive(Debug, Clone)]
 pub enum Event {
-    /// 连接建立，已知解码尺寸
+    /// 解码进程已启动，已知目标尺寸；尚不保证实际出帧。
     Opened {
         width: usize,
         height: usize,
         codec: String,
     },
     Frame(Frame),
-    /// 过程信息（ffmpeg stderr、重连提示）
+    /// 过程信息（ffmpeg stderr），可丢弃；不得据此推断连接状态。
     Status(String),
+    /// 已出帧的流中断。`retrying` 表示是否将自动重连；先于下一次 Opened/Frame 投递。
+    Interrupted {
+        retrying: bool,
+    },
     /// 本次连接失败，即将重试（或不再重试）
     Failed(String),
     /// 线程结束
@@ -166,7 +170,9 @@ fn supervisor(
                     "启动 ffmpeg 失败（{}）：{e}。请确认已安装 ffmpeg 或在配置里写全路径",
                     opts.ffmpeg
                 );
-                let _ = tx.try_send(Event::Failed(msg));
+                if !send_state(&tx, &stop, Event::Failed(msg)) {
+                    break;
+                }
                 if !opts.reconnect {
                     break;
                 }
@@ -177,7 +183,9 @@ fn supervisor(
         let stdout = match child.stdout.take() {
             Some(s) => s,
             None => {
-                let _ = tx.try_send(Event::Failed("ffmpeg 没有 stdout".into()));
+                let _ = send_state(&tx, &stop, Event::Failed("ffmpeg 没有 stdout".into()));
+                let _ = child.kill();
+                let _ = child.wait();
                 break;
             }
         };
@@ -207,15 +215,16 @@ fn supervisor(
         if let Ok(mut slot) = killer.lock() {
             *slot = Some(child);
         }
-        if !tx
-            .try_send(Event::Opened {
+        if !send_state(
+            &tx,
+            &stop,
+            Event::Opened {
                 width: w,
                 height: h,
                 codec,
-            })
-            .is_ok()
-        {
-            // 接收端已关闭
+            },
+        ) {
+            // 接收端关闭或取消；队列满时等待消费，不能误判为已断开。
             kill_child(&killer);
             break;
         }
@@ -260,16 +269,41 @@ fn supervisor(
 
         if got_any {
             backoff = Duration::from_millis(500);
-            status(&tx, "流中断，重连中…".to_string());
-        } else {
-            let _ = tx.try_send(Event::Failed("未取到任何视频帧".into()));
+            if !send_state(
+                &tx,
+                &stop,
+                Event::Interrupted {
+                    retrying: opts.reconnect,
+                },
+            ) {
+                break;
+            }
+        } else if !send_state(&tx, &stop, Event::Failed("未取到任何视频帧".into())) {
+            break;
         }
         if !opts.reconnect {
             break;
         }
     }
 
-    let _ = tx.try_send(Event::Closed);
+    let _ = send_state(&tx, &stop, Event::Closed);
+}
+
+/// 状态事件必须按序到达，不能像帧和日志一样因队列满而丢弃；取消时退出等待。
+fn send_state(tx: &SyncSender<Event>, stop: &AtomicBool, mut event: Event) -> bool {
+    loop {
+        if stop.load(Ordering::SeqCst) {
+            return false;
+        }
+        match tx.try_send(event) {
+            Ok(()) => return true,
+            Err(TrySendError::Disconnected(_)) => return false,
+            Err(TrySendError::Full(pending)) => {
+                event = pending;
+                thread::sleep(Duration::from_millis(5));
+            }
+        }
+    }
 }
 
 fn kill_child(killer: &Arc<Mutex<Option<Child>>>) {
@@ -303,4 +337,64 @@ fn now_ms() -> u128 {
         .duration_since(UNIX_EPOCH)
         .map(|d| d.as_millis())
         .unwrap_or(0)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::sync::mpsc::channel;
+
+    #[test]
+    fn state_event_survives_full_queue_in_order() {
+        let (tx, rx) = sync_channel(1);
+        tx.send(Event::Status("占满队列".into())).unwrap();
+        let stop = Arc::new(AtomicBool::new(false));
+        let sender_stop = Arc::clone(&stop);
+        let (done_tx, done_rx) = channel();
+        let sender = thread::spawn(move || {
+            let sent = send_state(&tx, &sender_stop, Event::Interrupted { retrying: true });
+            done_tx.send(sent).unwrap();
+        });
+        assert!(
+            done_rx.recv_timeout(Duration::from_millis(20)).is_err(),
+            "队列满时应等待，不能直接丢弃状态"
+        );
+        assert!(matches!(
+            rx.recv_timeout(Duration::from_secs(1)),
+            Ok(Event::Status(_))
+        ));
+        let sent = done_rx.recv_timeout(Duration::from_secs(1));
+        stop.store(true, Ordering::SeqCst);
+        let event = rx.recv_timeout(Duration::from_secs(1));
+        drop(rx);
+        sender.join().unwrap();
+        assert!(sent.unwrap());
+        assert!(matches!(event, Ok(Event::Interrupted { retrying: true })));
+    }
+
+    #[test]
+    fn state_event_wait_can_be_cancelled_without_draining_queue() {
+        let (tx, rx) = sync_channel(1);
+        tx.send(Event::Status("占满队列".into())).unwrap();
+        let stop = Arc::new(AtomicBool::new(false));
+        let sender_stop = Arc::clone(&stop);
+        let (done_tx, done_rx) = channel();
+        let sender = thread::spawn(move || {
+            let sent = send_state(&tx, &sender_stop, Event::Closed);
+            done_tx.send(sent).unwrap();
+        });
+        assert!(done_rx.recv_timeout(Duration::from_millis(20)).is_err());
+        stop.store(true, Ordering::SeqCst);
+        let sent = done_rx.recv_timeout(Duration::from_secs(1));
+        drop(rx);
+        sender.join().unwrap();
+        assert!(!sent.expect("取消后必须结束投递等待"));
+    }
+
+    #[test]
+    fn state_event_returns_when_receiver_has_closed() {
+        let (tx, rx) = sync_channel(1);
+        drop(rx);
+        assert!(!send_state(&tx, &AtomicBool::new(false), Event::Closed));
+    }
 }

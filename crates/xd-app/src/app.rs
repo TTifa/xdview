@@ -32,11 +32,15 @@ const OVERLAY_GAP: f32 = 7.0;
 /// 按钮行的淡入淡出时长（原型 `transition: opacity .4s`）
 const OVERLAY_FADE: f32 = 0.35;
 
-/// 右上角按钮行的预留宽度（4 个按钮 + 间距 + 边距）；拖窗时这块不响应拖动。
-const OVERLAY_BUTTONS_W: f32 = 310.0;
+/// 小窗态右上角按钮行的覆盖宽度（全屏 / 还原 / 复位，最多 3 个）；拖窗时这块不响应拖动。
+const OVERLAY_BUTTONS_W: f32 = 240.0;
 
 /// 关窗时等待最后一次偏好落盘的上限；超时就放弃——偏好可以丢一次，窗口不能关不掉。
 const CLOSE_DEFER_MAX: Duration = Duration::from_millis(1200);
+
+/// 扫描弹窗正文的固定高度：扫描中 / 无结果 / 结果列表三种状态共用，
+/// 弹窗高度就不会随设备条数或状态变化而跳动。
+const SCAN_BODY_H: f32 = 250.0;
 
 /// 界面形态：普通三栏 / 专注（只看视频）/ 小窗（专注 + 无边框置顶）。
 /// 全屏由视口单独管理。
@@ -167,6 +171,15 @@ enum Conn {
     Failed(String),
 }
 
+impl Conn {
+    /// 根据取流依赖处理 ONVIF 失败；媒体已启动时保留独立的媒体状态。
+    fn on_onvif_failure(&mut self, resolve_stream: bool, media_started: bool, message: &str) {
+        if resolve_stream && !media_started && matches!(self, Self::Connecting) {
+            *self = Self::Failed(message.to_string());
+        }
+    }
+}
+
 /// 日志级别：与原型的 INFO / OK / WARN / ERR 四色对应。
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum Level {
@@ -238,13 +251,75 @@ impl Stats {
     }
 }
 
+/// 显示中的预览帧。暂停只阻止帧替换，接收队列仍由 UI 正常消费，不积压历史视频。
+#[derive(Default)]
+struct Preview {
+    tex: Option<egui::TextureHandle>,
+    frame: Option<Frame>,
+    paused: bool,
+    /// 继续预览或媒体中断后，只有实际显示了新帧才能解除。
+    waiting_for_frame: bool,
+}
+
+impl Preview {
+    /// 显示帧是否已经可以作为实时画面展示（连接状态另由调用方判断）。
+    fn is_live(&self) -> bool {
+        self.frame.is_some() && !self.paused && !self.waiting_for_frame
+    }
+
+    fn invalidate(&mut self) {
+        self.waiting_for_frame = true;
+    }
+
+    /// 冻结帧和连接状态共用的画面提示，解码会话建立不代表已经恢复出帧。
+    fn notice(&self, conn: &Conn) -> Option<&'static str> {
+        self.frame.as_ref()?;
+        match conn {
+            Conn::Connecting => Some("重新连接中 · 当前画面非实时"),
+            Conn::Failed(_) => Some("连接失败 · 当前画面非实时"),
+            Conn::Idle => Some("已断开 · 当前画面非实时"),
+            Conn::Live { .. } if self.paused => Some("已暂停 · 当前画面已冻结"),
+            Conn::Live { .. } if !self.is_live() => Some("等待新画面 · 当前画面非实时"),
+            _ => None,
+        }
+    }
+
+    fn receive(&mut self, ctx: &egui::Context, frame: Frame) {
+        if self.paused {
+            return;
+        }
+        let img =
+            egui::ColorImage::from_rgba_unmultiplied([frame.width, frame.height], frame.as_slice());
+        // is_none_or 要 1.82，工作区 MSRV 是 1.81；这里等价于"没有纹理或尺寸变了"
+        if self
+            .tex
+            .as_ref()
+            .map_or(true, |t| t.size() != [frame.width, frame.height])
+        {
+            self.tex = Some(ctx.load_texture("video", img, egui::TextureOptions::LINEAR));
+        } else if let Some(t) = &mut self.tex {
+            t.set(img, egui::TextureOptions::LINEAR);
+        }
+        self.frame = Some(frame);
+        self.waiting_for_frame = false;
+    }
+
+    fn toggle(&mut self) {
+        if self.frame.is_some() {
+            self.paused = !self.paused;
+            if !self.paused {
+                self.invalidate();
+            }
+        }
+    }
+}
+
 pub struct XdView {
     cfg: AppConfig,
     cfg_path: PathBuf,
     selected: usize,
     stream: Option<Stream>,
-    tex: Option<egui::TextureHandle>,
-    frame: Option<Frame>,
+    preview: Preview,
     stats: Stats,
     conn: Conn,
     log: VecDeque<LogLine>,
@@ -261,6 +336,10 @@ pub struct XdView {
     storage: StoragePaths,
     discovered: Vec<DiscoveredDevice>,
     scanning: bool,
+    /// 扫描弹窗是否打开（结果与进度都在弹窗里，侧栏不再内联）
+    scan_open: bool,
+    /// 上一次扫描的失败原因（WS-Discovery 异常等），成功或重新扫描时清空
+    scan_error: Option<String>,
     /// 首帧时自动连接第一路（单机看护场景几乎总是希望一打开就出画面）
     autostart: bool,
     /// 每 2 秒把统计打到 stderr，便于无头/自动化验证（`--stats`）
@@ -384,8 +463,7 @@ impl XdView {
             cfg_path,
             selected: 0,
             stream: None,
-            tex: None,
-            frame: None,
+            preview: Preview::default(),
             stats: Stats::default(),
             conn: Conn::Idle,
             log: VecDeque::new(),
@@ -402,6 +480,8 @@ impl XdView {
             storage,
             discovered: Vec::new(),
             scanning: false,
+            scan_open: false,
+            scan_error: None,
             autostart: true,
             stats_stdout: false,
             stats_tick: None,
@@ -518,6 +598,7 @@ impl XdView {
         }
         self.stats_tick = Some(now);
         let size = self
+            .preview
             .frame
             .as_ref()
             .map(|f| format!("{}x{}", f.width, f.height))
@@ -571,8 +652,7 @@ impl XdView {
         self.ptz_lease_at = None;
         self.control.send(Command::Stop);
         self.control.send(Command::Disconnect);
-        self.tex = None;
-        self.frame = None;
+        self.preview = Preview::default();
         self.stats.reset();
         self.velocity = Velocity::default();
         self.conn = Conn::Connecting;
@@ -763,6 +843,8 @@ impl XdView {
 
     /// 只启动媒体流（不动 ONVIF 会话），供 GetStreamUri 回来之后调用。
     fn start_media(&mut self, url: &str) {
+        // 换码流/清晰度与重新连接都开始新预览，不能沿用上一会话的暂停帧。
+        self.preview = Preview::default();
         if let Some(mut s) = self.stream.take() {
             s.stop();
         }
@@ -880,6 +962,39 @@ impl XdView {
     }
 
     /// 把一个扫描到的 ONVIF 设备加进列表并立即接入。
+    /// 打开扫描弹窗；「没有结果 + 没在扫」时才真正发起一次探测。
+    ///
+    /// 结果保留到下一次探测：关掉弹窗再打开能看到上次扫到的设备，继续接入。
+    fn open_scan(&mut self) {
+        self.scan_open = true;
+        if self.discovered.is_empty() && !self.scanning {
+            self.start_scan();
+        }
+    }
+
+    /// 发起一次探测（WS-Discovery + 网段探测），结果经 `Feedback::Devices` 回来。
+    fn start_scan(&mut self) {
+        if self.scanning {
+            return;
+        }
+        self.scanning = true;
+        // 清掉上一轮，免得「扫描中」时还挂着旧结果或旧错误
+        self.discovered.clear();
+        self.scan_error = None;
+        self.push_log("发送 WS-Discovery 探测…");
+        self.control.send(Command::Discover { timeout_ms: 2000 });
+    }
+
+    /// 当前设备的连接状态短语（扫描弹窗卡片用；只对选中的那台准确）。
+    fn short_status(&self) -> (&'static str, egui::Color32) {
+        match &self.conn {
+            Conn::Live { .. } => ("已连接", self.pal.ok),
+            Conn::Connecting => ("连接中…", self.pal.warn),
+            Conn::Failed(_) => ("连接失败", self.pal.bad),
+            Conn::Idle => ("已加入", self.pal.dim),
+        }
+    }
+
     fn adopt(&mut self, dev: &DiscoveredDevice) {
         let Some(base) = dev.base_url() else {
             self.toast("设备地址无法解析");
@@ -910,6 +1025,7 @@ impl XdView {
     }
 
     fn disconnect(&mut self, log: bool) {
+        self.preview = Preview::default();
         self.stop_cache(false);
         if let Some(mut s) = self.stream.take() {
             s.stop();
@@ -947,6 +1063,7 @@ impl XdView {
                     height,
                     codec,
                 } => {
+                    self.preview.invalidate();
                     self.conn = Conn::Live {
                         width,
                         height,
@@ -958,29 +1075,36 @@ impl XdView {
                     );
                 }
                 Event::Frame(f) => {
-                    let img =
-                        egui::ColorImage::from_rgba_unmultiplied([f.width, f.height], f.as_slice());
-                    let needs_new = match &self.tex {
-                        Some(t) => t.size() != [f.width, f.height],
-                        None => true,
-                    };
-                    if needs_new {
-                        self.tex =
-                            Some(ctx.load_texture("video", img, egui::TextureOptions::LINEAR));
-                    } else if let Some(t) = &mut self.tex {
-                        t.set(img, egui::TextureOptions::LINEAR);
-                    }
+                    // 统计仍描述后台解码；暂停期间同样消费并丢弃新帧，不做纹理上传。
                     self.stats.on_frame(&f);
-                    self.frame = Some(f);
+                    self.preview.receive(ctx, f);
                 }
                 Event::Status(msg) => {
                     self.push_log(msg);
                 }
+                Event::Interrupted { retrying } => {
+                    self.preview.invalidate();
+                    self.conn = if retrying {
+                        Conn::Connecting
+                    } else {
+                        Conn::Idle
+                    };
+                    self.push_lv(
+                        Level::Warn,
+                        if retrying {
+                            "流中断，重连中…"
+                        } else {
+                            "流已中断"
+                        },
+                    );
+                }
                 Event::Failed(msg) => {
+                    self.preview.invalidate();
                     self.push_lv(Level::Err, format!("失败：{msg}"));
                     self.conn = Conn::Failed(msg);
                 }
                 Event::Closed => {
+                    self.preview.invalidate();
                     if !matches!(self.conn, Conn::Failed(_)) {
                         self.conn = Conn::Idle;
                     }
@@ -1012,6 +1136,7 @@ impl XdView {
                         );
                         self.toast("没扫到设备：部分设备（小度/TP-Link）不支持 WS-Discovery，可手动填 ONVIF 地址");
                     }
+                    self.scan_error = None;
                     self.discovered = list;
                 }
                 Feedback::StreamUri { uri, .. } => {
@@ -1071,6 +1196,23 @@ impl XdView {
                     self.push_lv(Level::Ok, msg.clone());
                     self.toast(msg);
                 }
+                Feedback::ConnectFailed {
+                    message,
+                    resolve_stream,
+                    ..
+                } => {
+                    // 错误携带原请求的取流依赖；已配置 RTSP 或媒体已启动时，ONVIF 只影响控制。
+                    self.conn
+                        .on_onvif_failure(resolve_stream, self.stream.is_some(), &message);
+                    self.push_lv(Level::Warn, message);
+                }
+                Feedback::ScanFailed { message } => {
+                    // 扫描失败要收尾：否则弹窗一直转圈、「重新扫描」还禁用
+                    self.scanning = false;
+                    self.discovered.clear();
+                    self.scan_error = Some(message.clone());
+                    self.push_lv(Level::Warn, message);
+                }
                 Feedback::Error { message, .. } => {
                     self.push_lv(Level::Warn, format!("云台：{message}"));
                 }
@@ -1123,7 +1265,7 @@ impl XdView {
     }
 
     fn snapshot(&mut self) {
-        let Some(frame) = &self.frame else {
+        let Some(frame) = &self.preview.frame else {
             self.toast("还没有画面可截图");
             return;
         };
@@ -1174,6 +1316,49 @@ impl XdView {
                 self.recorder = Some(r);
             }
             Err(e) => self.toast(e),
+        }
+    }
+
+    /// 只暂停预览显示，后台拉流、统计、录像和缓存继续工作。
+    fn toggle_preview_pause(&mut self) {
+        if self.preview.paused || matches!(self.conn, Conn::Live { .. }) {
+            self.preview.toggle();
+            self.push_log(if self.preview.paused {
+                "预览已暂停（录像和滚动缓存继续运行）"
+            } else {
+                "预览已继续，等待最新画面"
+            });
+        }
+    }
+
+    fn draw_pause_button(&mut self, ui: &mut egui::Ui, on_stage: bool) {
+        let pal = self.pal;
+        let enabled = self.preview.frame.is_some()
+            && (self.preview.paused || matches!(self.conn, Conn::Live { .. }));
+        let text = if self.preview.paused {
+            "继续预览"
+        } else {
+            "暂停"
+        };
+        if ui
+            .add_enabled(
+                enabled,
+                egui::Button::new(egui::RichText::new(text).size(12.0).color(if on_stage {
+                    pal.on_stage_text
+                } else {
+                    pal.text
+                }))
+                .fill(if on_stage {
+                    egui::Color32::from_black_alpha(160)
+                } else {
+                    pal.panel2
+                })
+                .corner_radius(6.0_f32),
+            )
+            .on_hover_text("暂停只定格预览；录像和缓存继续。继续后返回实时画面")
+            .clicked()
+        {
+            self.toggle_preview_pause();
         }
     }
 
@@ -1450,6 +1635,8 @@ impl XdView {
                     );
                     ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                         let scanning = self.scanning;
+                        // 扫描结果放独立弹窗（原型的做法）；侧栏只留设备卡，
+                        // 免得同一台设备在上下两处各出现一次。
                         let label = if scanning { "扫描中…" } else { "扫描局域网" };
                         let btn = egui::Button::new(egui::RichText::new(label).size(12.0))
                             .fill(if scanning {
@@ -1466,10 +1653,8 @@ impl XdView {
                                 },
                             ))
                             .corner_radius(6.0_f32);
-                        if ui.add_enabled(!scanning, btn).clicked() {
-                            self.scanning = true;
-                            self.push_log("发送 WS-Discovery 探测…");
-                            self.control.send(Command::Discover { timeout_ms: 2000 });
+                        if ui.add(btn).clicked() {
+                            self.open_scan();
                         }
                     });
                 });
@@ -1558,57 +1743,6 @@ impl XdView {
                             self.connect_selected();
                         }
 
-                        if !self.discovered.is_empty() {
-                            ui.add_space(4.0);
-                            ui.separator();
-                            ui.label(
-                                egui::RichText::new("发现（点接入即自动取流）")
-                                    .size(11.0)
-                                    .color(pal.faint),
-                            );
-                            ui.add_space(4.0);
-                            let list = self.discovered.clone();
-                            for dev in &list {
-                                // 与 adopt() 同一口径：已添加过的设备不再给「接入」，
-                                // 打「已添加」标记，避免看起来像"扫到了又不给加"。
-                                let already = dev
-                                    .base_url()
-                                    .map(|b| {
-                                        self.cfg.cameras.iter().any(|c| {
-                                            c.onvif_base().as_deref() == Some(b.as_str())
-                                        })
-                                    })
-                                    .unwrap_or(false);
-                                ui.horizontal(|ui| {
-                                    if already {
-                                        ui.add_enabled(
-                                            false,
-                                            egui::Button::new(
-                                                egui::RichText::new("已添加").size(10.0),
-                                            )
-                                            .fill(pal.panel2)
-                                            .corner_radius(6.0_f32),
-                                        );
-                                    } else if ui.small_button("接入").clicked() {
-                                        self.adopt(dev);
-                                    }
-                                    ui.label(
-                                        egui::RichText::new(dev.display_name())
-                                            .size(12.0)
-                                            .color(pal.msg),
-                                    );
-                                });
-                                ui.label(
-                                    egui::RichText::new(
-                                        dev.base_url().unwrap_or_else(|| "?".into()),
-                                    )
-                                    .monospace()
-                                    .size(10.0)
-                                    .color(pal.faint),
-                                );
-                                ui.add_space(4.0);
-                            }
-                        }
                     });
 
                 // 底部：添加设备（手填 ONVIF）/ 连接断开 / 导入导出 / 说明。
@@ -1758,6 +1892,7 @@ impl XdView {
             self.view_mode = self.view_mode.after_enter_focus();
             self.ie_open = false;
             self.add_open = false;
+            self.scan_open = false;
             self.add_error.clear();
             // 专注态没有侧栏，允许缩成小窗；普通态三栏需要 1100×700 起步
             ctx.send_viewport_cmd(egui::ViewportCommand::MinInnerSize(egui::vec2(
@@ -1879,6 +2014,7 @@ impl XdView {
             return (r.w.min(2000) as f32, r.h.min(2000) as f32);
         }
         let (fw, fh) = self
+            .preview
             .frame
             .as_ref()
             .map(|f| (f.width as f32, f.height as f32))
@@ -2017,7 +2153,11 @@ impl XdView {
                 if button(ui, OverlayIcon::Fullscreen, "全屏", is_fullscreen(&ctx)).clicked() {
                     self.toggle_fullscreen(&ctx);
                 }
-                if button(ui, OverlayIcon::Mini, "小窗", self.view_mode.is_mini()).clicked() {
+                // 「小窗」只是入口：小窗态里它的作用是退出小窗（回到大窗专注），
+                // 和「还原」都是"离开小窗"，摆两个出口只会让人分不清，所以小窗态不显示。
+                if !self.view_mode.is_mini()
+                    && button(ui, OverlayIcon::Mini, "小窗", false).clicked()
+                {
                     self.toggle_mini(&ctx);
                 }
                 if button(ui, OverlayIcon::Restore, "还原", false).clicked() {
@@ -2052,7 +2192,7 @@ impl XdView {
                 // 画面层始终是深底：浅色主题只换外围面板，视频区保持原型 .stage 的观感
                 painter.rect_filled(rect, 0.0_f32, pal.stage);
 
-                match (&self.tex, self.frame.as_ref()) {
+                match (&self.preview.tex, self.preview.frame.as_ref()) {
                     (Some(tex), Some(frame)) => {
                         // 数字变焦：按 zoom/zoom_uv_min 裁 UV（纯软件，不动摄像头）。
                         // 设备名/分辨率/码流等参数已在两侧面板展示，画面不再叠字。
@@ -2118,6 +2258,24 @@ impl XdView {
                     }
                 }
 
+                if self.preview.frame.is_some() {
+                    let notice = self.preview.notice(&self.conn);
+                    if let Some(text) = notice {
+                        let badge = egui::Rect::from_min_size(
+                            rect.min + egui::vec2(14.0, 14.0),
+                            egui::vec2(208.0, 28.0),
+                        );
+                        painter.rect_filled(badge, 6.0_f32, egui::Color32::from_black_alpha(180));
+                        painter.text(
+                            badge.center(),
+                            egui::Align2::CENTER_CENTER,
+                            text,
+                            egui::FontId::proportional(12.0),
+                            pal.on_stage_text,
+                        );
+                    }
+                }
+
                 // 双击：普通模式进入专注模式（只看视频）；专注模式内双击复位变焦
                 if resp.double_clicked() {
                     if self.view_mode.is_focus() {
@@ -2139,7 +2297,7 @@ impl XdView {
                 }
 
                 // ---- 数字变焦交互：滚轮缩放、拖动平移 ----
-                if let Some((fw, fh)) = self.frame.as_ref().map(|f| (f.width, f.height)) {
+                if let Some((fw, fh)) = self.preview.frame.as_ref().map(|f| (f.width, f.height)) {
                     let dst = fit_rect(rect, fw, fh);
                     let scroll = ui.input(|i| i.smooth_scroll_delta.y);
                     if resp.hovered() && scroll.abs() > 0.0 {
@@ -2225,7 +2383,15 @@ impl XdView {
                             ui.set_height(bar_h);
                             ui.horizontal_centered(|ui| {
                                 let (_st, color) = self.status_of();
-                                let prefix = if matches!(self.conn, Conn::Live { .. }) {
+                                let prefix = if matches!(self.conn, Conn::Live { .. })
+                                    && self.preview.paused
+                                {
+                                    "预览已暂停"
+                                } else if matches!(self.conn, Conn::Live { .. })
+                                    && !self.preview.is_live()
+                                {
+                                    "等待新画面"
+                                } else if matches!(self.conn, Conn::Live { .. }) {
                                     "实时预览"
                                 } else {
                                     "连接状态"
@@ -2233,6 +2399,7 @@ impl XdView {
                                 ui.label(
                                     egui::RichText::new(prefix).size(12.0).strong().color(color),
                                 );
+                                self.draw_pause_button(ui, false);
                                 ui.label(
                                     egui::RichText::new(format!(
                                         " · {} · {}",
@@ -2361,6 +2528,14 @@ impl XdView {
                 }
                 if self.view_mode.is_focus() {
                     self.draw_focus_overlay(ui, rect);
+                    // 单独的前景层避免点击暂停按钮时触发视频拖窗；暂停后入口始终可见。
+                    if self.preview.frame.is_some() {
+                        egui::Area::new(egui::Id::new("preview_pause_control"))
+                            .order(egui::Order::Foreground)
+                            .fixed_pos(egui::pos2(rect.left() + 14.0, rect.bottom() - 42.0))
+                            .movable(false)
+                            .show(ctx, |ui| self.draw_pause_button(ui, true));
+                    }
                 }
             });
     }
@@ -2888,8 +3063,8 @@ impl XdView {
                 egui::Layout::left_to_right(egui::Align::Center),
                 |ui| {
                     ui.spacing_mut().item_spacing.x = 0.0;
-                    // 左列定宽 = 行宽 - 间距 - 开关宽，保证开关不被右缘裁掉
-                    let left_w = (row_w - 8.0 - 48.0).max(80.0);
+                    // 为原型的 34×18 滑动开关留出固定位置，文字不得把开关挤出面板。
+                    let left_w = (row_w - 8.0 - 34.0).max(0.0);
                     ui.allocate_ui_with_layout(
                         egui::vec2(left_w, 42.0),
                         egui::Layout::top_down(egui::Align::Min),
@@ -2924,11 +3099,7 @@ impl XdView {
                                     format!("保留最近 {} 分钟", self.cfg.settings.cache_minutes)
                                 }
                             } else {
-                                format!(
-                                    "保留最近 {} 分钟，每片 {} 秒",
-                                    self.cfg.settings.cache_minutes,
-                                    self.cfg.settings.cache_segment_secs
-                                )
+                                "启动即切片落盘，只留最近 N 分钟".to_string()
                             };
                             ui.add_sized(
                                 egui::vec2(left_w, 14.0),
@@ -2943,26 +3114,81 @@ impl XdView {
                         },
                     );
                     ui.add_space(8.0);
-                    toggle_clicked = toggle_pill(ui, &pal, if on { "开" } else { "关" }, on, 48.0);
+                    toggle_clicked = cache_switch(ui, &pal, on).clicked();
                 },
             );
             if toggle_clicked {
                 self.toggle_cache();
             }
-            ui.add_space(8.0);
-            if ui
-                .add_enabled(
-                    on,
-                    egui::Button::new(egui::RichText::new("导出最近 10 分钟").size(12.0))
-                        .fill(if on { pal.accent_fill } else { pal.panel2 })
-                        .stroke(egui::Stroke::new(
-                            1.0_f32,
-                            if on { pal.accent_stroke } else { pal.border },
-                        ))
-                        .corner_radius(6.0_f32),
-                )
-                .clicked()
-            {
+            ui.add_space(6.0);
+            let export = ui
+                .scope(|ui| {
+                    // 与原型 .cache-body.off 一致：整块淡化，避免禁用色与透明度叠加两次。
+                    if !on {
+                        ui.multiply_opacity(0.4);
+                    }
+                    ui.horizontal(|ui| {
+                        ui.spacing_mut().item_spacing.x = 0.0;
+                        let field_w = ((ui.available_width() - 8.0) / 2.0).max(0.0);
+                        cache_config_field(
+                            ui,
+                            &pal,
+                            field_w,
+                            "保留时长",
+                            &format!("{} 分钟", self.cfg.settings.cache_minutes),
+                        );
+                        ui.add_space(8.0);
+                        cache_config_field(
+                            ui,
+                            &pal,
+                            field_w,
+                            "切片粒度",
+                            &format!("{} 秒", self.cfg.settings.cache_segment_secs),
+                        );
+                    });
+                    ui.add_space(10.0);
+                    // 使用整行宽度；关闭态只绘制，不注册点击，颜色由上面的整体透明度控制。
+                    let (rect, resp) = ui.allocate_exact_size(
+                        egui::vec2(ui.available_width(), 32.0),
+                        if on {
+                            egui::Sense::click()
+                        } else {
+                            egui::Sense::hover()
+                        },
+                    );
+                    let p = ui.painter_at(rect);
+                    p.rect_filled(
+                        rect,
+                        6.0,
+                        if on && resp.hovered() {
+                            pal.active_bg
+                        } else {
+                            pal.accent_fill
+                        },
+                    );
+                    p.rect_stroke(
+                        rect,
+                        6.0,
+                        egui::Stroke::new(1.0_f32, pal.accent_stroke),
+                        egui::StrokeKind::Inside,
+                    );
+                    p.text(
+                        rect.center(),
+                        egui::Align2::CENTER_CENTER,
+                        "导出最近 10 分钟",
+                        egui::FontId::proportional(12.0),
+                        pal.ok,
+                    );
+                    resp.on_hover_text(if on {
+                        "将最近 10 分钟的缓存片段导出为视频"
+                    } else {
+                        "开启滚动缓存后可导出"
+                    })
+                    .clicked()
+                        && on
+                })
+                .inner;
+            if export {
                 self.export_cache(10);
             }
             if self.cache_retry_at.is_some() {
@@ -3033,6 +3259,285 @@ impl XdView {
     }
 
     /// 「添加设备」弹窗：手填 ONVIF 地址/账号（扫描不可用时的正路）。
+    /// 扫描弹窗：结果、进度、失败说明都在这里，侧栏只保留设备卡。
+    ///
+    /// 「接入」直接走 `adopt()`（GetProfiles → GetStreamUri → 写 config.toml），
+    /// 成功后该条变「已接入」；点已接入的那条会关掉弹窗并切到该设备。
+    fn draw_scan_window(&mut self, ctx: &egui::Context) {
+        let pal = self.pal;
+        if !self.scan_open {
+            return;
+        }
+        let mut open = true;
+        let mut restart = false;
+        let mut manual = false;
+        let mut close_clicked = false;
+        let mut pick: Option<usize> = None;
+        egui::Window::new("扫描局域网")
+            .open(&mut open)
+            .collapsible(false)
+            .resizable(false)
+            .default_width(460.0)
+            .show(ctx, |ui| {
+                ui.label(
+                    egui::RichText::new(
+                        "WS-Discovery 组播 + 网段探测，只覆盖同一广播域；设备需已开启 ONVIF。",
+                    )
+                    .size(11.0)
+                    .color(pal.faint),
+                );
+                ui.add_space(10.0);
+
+                // 三种状态都画在同一块固定高度里，弹窗高度保持稳定
+                ui.set_min_width(430.0);
+                ui.allocate_ui_with_layout(
+                    egui::vec2(ui.available_width(), SCAN_BODY_H),
+                    egui::Layout::top_down(egui::Align::Min),
+                    |ui| {
+                        // allocate_ui_with_layout 只限制不占位，要显式撑到固定高度
+                        ui.set_min_height(SCAN_BODY_H);
+                if self.scanning {
+                    ui.add_space((SCAN_BODY_H - 64.0) * 0.5);
+                    ui.horizontal(|ui| {
+                        ui.add(egui::Spinner::new().size(16.0));
+                        ui.label(
+                            egui::RichText::new("正在探测局域网内的 ONVIF 设备…")
+                                .size(12.0)
+                                .color(pal.dim),
+                        );
+                    });
+                    ui.add_space(6.0);
+                    ui.label(
+                        egui::RichText::new(
+                            "小度、TP-Link(Tapo) 等不响应 WS-Discovery，扫不到属正常，可手动填写地址。",
+                        )
+                        .size(11.0)
+                        .color(pal.faint),
+                    );
+                } else if self.discovered.is_empty() {
+                    ui.add_space((SCAN_BODY_H - 96.0) * 0.5);
+                    let (title, color) = match &self.scan_error {
+                        Some(e) => (e.clone(), pal.bad),
+                        None => ("没有发现设备。".to_string(), pal.warn),
+                    };
+                    ui.label(egui::RichText::new(title).size(12.0).color(color));
+                    ui.add_space(4.0);
+                    ui.label(
+                        egui::RichText::new(
+                            "确认设备已开启 ONVIF、与电脑同网段、防火墙放行 UDP 3702；\
+                             不响应组播的设备请用「手动添加」。",
+                        )
+                        .size(11.0)
+                        .color(pal.faint),
+                    );
+                } else {
+                    ui.label(
+                        egui::RichText::new(format!(
+                            "发现 {} 台 ONVIF 设备",
+                            self.discovered.len()
+                        ))
+                        .size(11.0)
+                        .strong()
+                        .color(pal.dim),
+                    );
+                    ui.add_space(6.0);
+                    let list = self.discovered.clone();
+                    egui::ScrollArea::vertical()
+                        .id_salt("scan_list")
+                        .max_height(SCAN_BODY_H - 26.0)
+                        .auto_shrink([false, true])
+                        .show(ui, |ui| {
+                            for dev in &list {
+                                let url = dev.base_url().unwrap_or_else(|| dev.endpoint.clone());
+                                let name = dev.display_name();
+                                // 和设备列表一样按 ONVIF 入口匹配：设备自报的名字和 config
+                                // 里的 name 常常不同，标题用列表里的那个才对得上号。
+                                let linked = self
+                                    .cfg
+                                    .cameras
+                                    .iter()
+                                    .position(|c| c.onvif_base().as_deref() == Some(url.as_str()));
+                                let title = match linked {
+                                    Some(i) => self.cfg.cameras[i].name.clone(),
+                                    None if name == url => "ONVIF 设备".to_string(),
+                                    None => name,
+                                };
+                                let card = egui::Frame::new()
+                                    .fill(pal.panel2)
+                                    .stroke(egui::Stroke::new(
+                                        1.0_f32,
+                                        if linked.is_some() {
+                                            pal.accent_stroke
+                                        } else {
+                                            pal.border
+                                        },
+                                    ))
+                                    .corner_radius(8.0_f32)
+                                    .inner_margin(egui::Margin {
+                                        left: 13,
+                                        right: 13,
+                                        top: 11,
+                                        bottom: 11,
+                                    })
+                                    .show(ui, |ui| {
+                                        ui.horizontal(|ui| {
+                                            ui.allocate_ui_with_layout(
+                                                egui::vec2((ui.available_width() - 74.0).max(120.0), 18.0),
+                                                egui::Layout::left_to_right(egui::Align::Center),
+                                                |ui| {
+                                                    ui.add(
+                                                        egui::Label::new(
+                                                            egui::RichText::new(title)
+                                                                .size(13.0)
+                                                                .strong()
+                                                                .color(pal.text),
+                                                        )
+                                                        .truncate(),
+                                                    );
+                                                },
+                                            );
+                                            ui.with_layout(
+                                                egui::Layout::right_to_left(egui::Align::Center),
+                                                |ui| {
+                                                    if let Some(i) = linked {
+                                                        // "已接入" 只代表进了配置；连接是否成功要看 conn。
+                                                        // 只有当前选中的设备有连接状态，其余如实显示「已加入」。
+                                                        let (label, color) = if i == self.selected {
+                                                            self.short_status()
+                                                        } else {
+                                                            ("已加入", pal.dim)
+                                                        };
+                                                        ui.label(
+                                                            egui::RichText::new(label)
+                                                                .size(11.0)
+                                                                .color(color),
+                                                        );
+                                                    } else if ui
+                                                        .add(
+                                                            egui::Button::new(
+                                                                egui::RichText::new("接入")
+                                                                    .size(11.0)
+                                                                    .color(pal.ok),
+                                                            )
+                                                            .fill(pal.panel2)
+                                                            .stroke(egui::Stroke::new(
+                                                                1.0_f32,
+                                                                pal.accent_stroke,
+                                                            ))
+                                                            .corner_radius(6.0_f32),
+                                                        )
+                                                        .clicked()
+                                                    {
+                                                        self.adopt(dev);
+                                                    }
+                                                },
+                                            );
+                                        });
+                                        ui.add_space(3.0);
+                                        ui.add(
+                                            egui::Label::new(
+                                                egui::RichText::new(url.clone())
+                                                    .monospace()
+                                                    .size(10.0)
+                                                    .color(pal.dim),
+                                            )
+                                            .truncate(),
+                                        );
+                                    });
+                                if let Some(i) = linked {
+                                    let hit = ui
+                                        .interact(
+                                            card.response.rect,
+                                            ui.id().with(("scan", url.as_str())),
+                                            egui::Sense::click(),
+                                        )
+                                        .on_hover_text("已接入 · 点击切到该设备");
+                                    if hit.hovered() {
+                                        ui.ctx().set_cursor_icon(egui::CursorIcon::PointingHand);
+                                        ui.painter_at(card.response.rect).rect_stroke(
+                                            card.response.rect,
+                                            8.0_f32,
+                                            egui::Stroke::new(1.0_f32, pal.accent_stroke),
+                                            egui::StrokeKind::Inside,
+                                        );
+                                    }
+                                    if hit.clicked() {
+                                        pick = Some(i);
+                                    }
+                                }
+                                ui.add_space(8.0);
+                            }
+                        });
+                }
+                    },
+                );
+
+                ui.add_space(10.0);
+                ui.separator();
+                ui.add_space(6.0);
+                ui.horizontal(|ui| {
+                    if ui
+                        .add_enabled(
+                            !self.scanning,
+                            egui::Button::new(egui::RichText::new("重新扫描").size(12.0)),
+                        )
+                        .clicked()
+                    {
+                        restart = true;
+                    }
+                    if ui
+                        .add(egui::Button::new(
+                            egui::RichText::new("手动添加").size(12.0),
+                        ))
+                        .clicked()
+                    {
+                        manual = true;
+                    }
+                    ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                        if ui
+                            .add(egui::Button::new(
+                                egui::RichText::new("关闭").size(12.0),
+                            ))
+                            .clicked()
+                        {
+                            close_clicked = true;
+                        }
+                    });
+                });
+                ui.add_space(4.0);
+                ui.label(
+                    egui::RichText::new(
+                        "接入 = 加入设备列表并尝试起播（写入 config.toml）；需要账号/鉴权的设备可能连接失败。",
+                    )
+                    .size(10.0)
+                    .color(pal.faint),
+                );
+            });
+
+        if restart {
+            self.start_scan();
+        }
+        if manual {
+            self.scan_open = false;
+            self.add_open = true;
+            self.add_error.clear();
+        }
+        if let Some(i) = pick {
+            self.scan_open = false;
+            // 已经在这台设备上播放/连接时才跳过；失败、空闲都要重连——
+            // 拉流失败后 Stream 对象仍然存在，不能拿 stream.is_none() 当判据。
+            let busy = matches!(self.conn, Conn::Live { .. } | Conn::Connecting);
+            if self.selected != i || !busy {
+                self.selected = i;
+                self.reset_zoom();
+                self.connect_selected();
+            }
+        }
+        if close_clicked || !open {
+            self.scan_open = false;
+        }
+    }
+
     fn draw_add_window(&mut self, ctx: &egui::Context) {
         let pal = self.pal;
         if !self.add_open {
@@ -3209,6 +3714,8 @@ impl eframe::App for XdView {
             if self.add_open {
                 self.add_open = false;
                 self.add_error.clear();
+            } else if self.scan_open {
+                self.scan_open = false;
             } else if self.ie_open {
                 self.ie_open = false;
             } else if is_fullscreen(ctx) {
@@ -3227,6 +3734,7 @@ impl eframe::App for XdView {
             self.draw_video(ctx);
         }
         self.draw_ie_window(ctx);
+        self.draw_scan_window(ctx);
         self.draw_add_window(ctx);
         self.draw_toast(ctx);
 
@@ -3639,7 +4147,80 @@ fn pad(ui: &mut egui::Ui, pal: &Palette, label: &str) -> egui::Response {
     )
 }
 
-/// 开关小药丸（左右反向 / 缓存开·关）。
+/// 缓存滑动开关：对齐原型的 34×18 轨道和 14px 圆点，不在开关内挤入文字。
+fn cache_switch(ui: &mut egui::Ui, pal: &Palette, on: bool) -> egui::Response {
+    let (rect, resp) = ui.allocate_exact_size(egui::vec2(34.0, 18.0), egui::Sense::click());
+    let p = ui.painter_at(rect);
+    p.rect_filled(
+        rect,
+        9.0,
+        if on {
+            pal.accent_stroke
+        } else {
+            pal.border_strong
+        },
+    );
+    p.circle_filled(
+        egui::pos2(rect.left() + if on { 25.0 } else { 9.0 }, rect.center().y),
+        7.0,
+        if on { pal.ok } else { pal.dim },
+    );
+    if resp.hovered() {
+        ui.ctx().set_cursor_icon(egui::CursorIcon::PointingHand);
+    }
+    resp.on_hover_text(if on {
+        "关闭滚动缓存"
+    } else {
+        "开启滚动缓存"
+    })
+}
+
+/// 参数展示框沿用原型下拉框的形态。本轮只读展示配置，不提供菜单或修改运行参数。
+fn cache_config_field(ui: &mut egui::Ui, pal: &Palette, width: f32, label: &str, value: &str) {
+    ui.allocate_ui_with_layout(
+        egui::vec2(width, 44.0),
+        egui::Layout::top_down(egui::Align::Min),
+        |ui| {
+            ui.spacing_mut().item_spacing.y = 4.0;
+            ui.label(egui::RichText::new(label).size(10.0).color(pal.faint));
+            let (rect, resp) =
+                ui.allocate_exact_size(egui::vec2(width, 28.0), egui::Sense::hover());
+            let p = ui.painter_at(rect);
+            p.rect_filled(rect, 6.0, pal.panel2);
+            p.rect_stroke(
+                rect,
+                6.0,
+                egui::Stroke::new(1.0_f32, pal.border),
+                egui::StrokeKind::Inside,
+            );
+            // 右侧预留箭头宽度，非默认配置的数值也不能压住箭头。
+            let text_rect = rect.shrink2(egui::vec2(10.0, 0.0));
+            p.with_clip_rect(egui::Rect::from_min_max(
+                text_rect.min,
+                egui::pos2(text_rect.right() - 12.0, text_rect.bottom()),
+            ))
+            .text(
+                text_rect.left_center(),
+                egui::Align2::LEFT_CENTER,
+                value,
+                egui::FontId::proportional(12.0),
+                pal.dim,
+            );
+            let c = egui::pos2(rect.right() - 10.0, rect.center().y);
+            p.add(egui::Shape::line(
+                vec![
+                    c + egui::vec2(-3.0, -1.5),
+                    c + egui::vec2(0.0, 1.5),
+                    c + egui::vec2(3.0, -1.5),
+                ],
+                egui::Stroke::new(1.0_f32, pal.dim),
+            ));
+            resp.on_hover_text("当前配置（只读）；可在配置文件中调整");
+        },
+    );
+}
+
+/// 开关小药丸（左右反向）。
 fn toggle_pill(ui: &mut egui::Ui, pal: &Palette, label: &str, on: bool, width: f32) -> bool {
     let bg = if on { pal.accent_fill } else { pal.panel2 };
     let stroke = if on {
@@ -3871,6 +4452,148 @@ fn local_bias_minutes() -> i32 {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn preview_test_frame(seq: u64, width: usize) -> Frame {
+        Frame {
+            width,
+            height: 1,
+            rgba: vec![seq as u8; width * 4],
+            seq,
+            captured_ms: seq as u128,
+        }
+    }
+
+    #[test]
+    fn paused_preview_keeps_displayed_pixels_and_resume_skips_discarded_frames() {
+        let ctx = egui::Context::default();
+        let mut preview = Preview::default();
+        preview.receive(&ctx, preview_test_frame(1, 1));
+        preview.toggle();
+        let frozen_texture = preview.tex.as_ref().unwrap().id();
+        // 模拟持续消费队列：分辨率和像素都改变，也不能替换暂停帧。
+        for seq in 2..20 {
+            preview.receive(&ctx, preview_test_frame(seq, 2));
+        }
+        assert_eq!(preview.frame.as_ref().unwrap().seq, 1);
+        assert_eq!(preview.frame.as_ref().unwrap().rgba, vec![1; 4]);
+        assert_eq!(preview.tex.as_ref().unwrap().id(), frozen_texture);
+        assert_eq!(preview.tex.as_ref().unwrap().size(), [1, 1]);
+        preview.toggle();
+        preview.receive(&ctx, preview_test_frame(20, 2));
+        assert_eq!(preview.frame.as_ref().unwrap().seq, 20);
+        assert_eq!(preview.tex.as_ref().unwrap().size(), [2, 1]);
+    }
+
+    #[test]
+    fn resume_waits_for_an_actual_new_frame_before_marking_live() {
+        let ctx = egui::Context::default();
+        let mut preview = Preview::default();
+        preview.receive(&ctx, preview_test_frame(1, 1));
+        assert!(preview.is_live());
+        preview.toggle();
+        preview.receive(&ctx, preview_test_frame(2, 1));
+        preview.toggle();
+        assert!(!preview.is_live(), "继续按钮不能把冻结帧立即标为实时");
+        assert_eq!(preview.frame.as_ref().unwrap().seq, 1);
+        preview.receive(&ctx, preview_test_frame(3, 1));
+        assert!(preview.is_live());
+        assert_eq!(preview.frame.as_ref().unwrap().seq, 3);
+    }
+
+    #[test]
+    fn optional_onvif_failure_does_not_fail_connecting_rtsp() {
+        let mut conn = Conn::Connecting;
+        conn.on_onvif_failure(false, true, "ONVIF 鉴权失败");
+        assert!(
+            matches!(conn, Conn::Connecting),
+            "RTSP 仍在连接，不能误报预览失败"
+        );
+    }
+
+    #[test]
+    fn reconnecting_and_opened_without_frames_keep_old_preview_non_live() {
+        let ctx = egui::Context::default();
+        let mut preview = Preview::default();
+        let live = Conn::Live {
+            width: 1,
+            height: 1,
+            codec: "test".into(),
+        };
+        preview.receive(&ctx, preview_test_frame(1, 1));
+        preview.toggle();
+        // Interrupted 后保留冻结帧，继续按钮不能解除非实时提示。
+        preview.invalidate();
+        preview.toggle();
+        assert_eq!(
+            preview.notice(&Conn::Connecting),
+            Some("重新连接中 · 当前画面非实时")
+        );
+        // Opened 只说明进程启动，尚未有恢复后的第一帧。
+        preview.invalidate();
+        assert!(!preview.is_live());
+        assert_eq!(preview.notice(&live), Some("等待新画面 · 当前画面非实时"));
+        assert_eq!(preview.frame.as_ref().unwrap().seq, 1);
+        preview.receive(&ctx, preview_test_frame(3, 2));
+        assert!(preview.is_live());
+        assert_eq!(preview.notice(&live), None);
+        preview.invalidate();
+        assert_eq!(
+            preview.notice(&Conn::Failed("断流".into())),
+            Some("连接失败 · 当前画面非实时")
+        );
+        assert_eq!(preview.notice(&Conn::Idle), Some("已断开 · 当前画面非实时"));
+    }
+
+    #[test]
+    fn reconnect_does_not_unpause_preview_or_accept_background_frames() {
+        let ctx = egui::Context::default();
+        let mut preview = Preview::default();
+        preview.receive(&ctx, preview_test_frame(1, 1));
+        preview.toggle();
+        preview.invalidate();
+        preview.receive(&ctx, preview_test_frame(2, 2));
+        assert!(preview.paused);
+        assert!(!preview.is_live());
+        assert_eq!(preview.frame.as_ref().unwrap().seq, 1);
+        preview.toggle();
+        assert!(!preview.is_live());
+        preview.receive(&ctx, preview_test_frame(3, 2));
+        assert!(preview.is_live());
+    }
+
+    #[test]
+    fn required_onvif_failure_only_fails_preview_before_media_starts() {
+        let mut conn = Conn::Connecting;
+        conn.on_onvif_failure(true, false, "无法获取流地址");
+        assert!(matches!(&conn, Conn::Failed(e) if e == "无法获取流地址"));
+        let mut conn = Conn::Connecting;
+        conn.on_onvif_failure(true, true, "迟到的取流失败");
+        assert!(matches!(conn, Conn::Connecting));
+        let mut conn = Conn::Live {
+            width: 1,
+            height: 1,
+            codec: "test".into(),
+        };
+        conn.on_onvif_failure(false, true, "云台不可用");
+        assert!(matches!(conn, Conn::Live { .. }));
+    }
+
+    #[test]
+    fn new_preview_session_clears_pause_and_old_device_frame() {
+        let ctx = egui::Context::default();
+        let mut preview = Preview::default();
+        preview.toggle();
+        assert!(!preview.paused, "首帧到来前不可暂停");
+        preview.receive(&ctx, preview_test_frame(1, 1));
+        preview.toggle();
+        assert!(preview.paused);
+        preview = Preview::default();
+        assert!(!preview.paused);
+        assert!(preview.frame.is_none());
+        assert!(preview.tex.is_none());
+        preview.receive(&ctx, preview_test_frame(2, 2));
+        assert_eq!(preview.frame.as_ref().unwrap().seq, 2);
+    }
 
     #[test]
     fn timeout_close_request_is_not_deferred_again() {
