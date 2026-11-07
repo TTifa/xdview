@@ -16,9 +16,71 @@
 //! * 永远保留最新 2 个片段 —— 否则流断掉、缓存刚重启时容易把仅有的内容删光。
 
 use crate::ffmpeg::{apply_net, input_args, NetOptions};
+use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Stdio};
+use std::sync::Mutex;
 use std::time::{SystemTime, UNIX_EPOCH};
+
+// 只在选择/登记及扫描/删除时持锁，ffmpeg 运行期间不阻塞其他目录的清理。
+// 规范目录路径使相对路径与目录别名指向同一份保留记录；只协调本进程内的清理。
+static EXPORT_PINS: Mutex<BTreeMap<PathBuf, usize>> = Mutex::new(BTreeMap::new());
+
+struct PinnedSegments(Vec<PathBuf>);
+
+impl PinnedSegments {
+    fn select(dir: &Path, last_secs: u64) -> Result<Self, String> {
+        let dir = std::fs::canonicalize(dir)
+            .map_err(|e| format!("读取导出目录失败：{e}；请检查缓存目录后重试"))?;
+        let mut pins = EXPORT_PINS
+            .lock()
+            .map_err(|_| "缓存保留状态异常，请重启程序后重试".to_string())?;
+        let picked = segments_since(&list_segments(&dir), now_secs(), last_secs);
+        for path in &picked {
+            *pins.entry(path.clone()).or_default() += 1;
+        }
+        Ok(Self(picked))
+    }
+}
+
+impl Drop for PinnedSegments {
+    fn drop(&mut self) {
+        // 中毒时保留旧记录并停止清理，不能冒险删除仍被使用的片段。
+        if let Ok(mut pins) = EXPORT_PINS.lock() {
+            for path in &self.0 {
+                if let Some(count) = pins.get_mut(path) {
+                    *count -= 1;
+                    if *count == 0 {
+                        pins.remove(path);
+                    }
+                }
+            }
+        }
+    }
+}
+
+fn prune_directory(dir: &Path, keep_secs: Option<u64>) -> usize {
+    let Ok(dir) = std::fs::canonicalize(dir) else {
+        return 0;
+    };
+    let Ok(pins) = EXPORT_PINS.lock() else {
+        return 0;
+    };
+    let all = scan_segments(&dir);
+    let mut candidates: Vec<PathBuf> = all
+        .iter()
+        .filter(|(_, size, _)| *size == 0)
+        .map(|(path, _, _)| path.clone())
+        .collect();
+    if let Some(keep_secs) = keep_secs {
+        let files: Vec<_> = all.into_iter().filter(|(_, size, _)| *size > 0).collect();
+        candidates.extend(expired(&files, now_secs(), keep_secs));
+    }
+    candidates
+        .into_iter()
+        .filter(|path| !pins.contains_key(path) && std::fs::remove_file(path).is_ok())
+        .count()
+}
 
 /// 缓存参数。
 #[derive(Debug, Clone)]
@@ -163,24 +225,10 @@ impl SegmentCache {
         }
     }
 
-    /// 删掉超过保留时长的片段，返回删除个数。
+    /// 删掉超过保留时长的片段，跳过本进程正在导出的片段，返回删除个数。
+    /// 保留状态异常时停止清理；不保护其他进程或用户手动删除的文件。
     pub fn prune(&self) -> usize {
-        let all = scan_segments(&self.opts.dir);
-        let mut n = 0;
-        // 0 字节残片：父进程被强杀时 ffmpeg 来不及写头，留在盘上纯属垃圾
-        for (path, size, _) in &all {
-            if *size == 0 && std::fs::remove_file(path).is_ok() {
-                n += 1;
-            }
-        }
-        let files: Vec<(PathBuf, u64, u64)> =
-            all.into_iter().filter(|(_, sz, _)| *sz > 0).collect();
-        for path in expired(&files, now_secs(), self.opts.keep_secs) {
-            if std::fs::remove_file(&path).is_ok() {
-                n += 1;
-            }
-        }
-        n
+        prune_directory(&self.opts.dir, Some(self.opts.keep_secs))
     }
 
     /// 停缓存：先请 ffmpeg 收尾（写完当前片段），2 秒内不退再强杀。
@@ -210,14 +258,7 @@ impl SegmentCache {
 impl Drop for SegmentCache {
     fn drop(&mut self) {
         self.quit();
-        let empty: Vec<PathBuf> = scan_segments(&self.opts.dir)
-            .into_iter()
-            .filter(|(_, size, _)| *size == 0)
-            .map(|(p, _, _)| p)
-            .collect();
-        for p in empty {
-            let _ = std::fs::remove_file(p);
-        }
+        prune_directory(&self.opts.dir, None);
     }
 }
 
@@ -280,7 +321,7 @@ pub fn expired(files: &[(PathBuf, u64, u64)], now: u64, keep_secs: u64) -> Vec<P
         .collect()
 }
 
-/// 挑出导出用的片段：mtime 不早于 `now - last_secs`；即使全都超时也至少给最新一个。
+/// 挑出导出用的片段：mtime 不早于 `now - last_secs`；时间窗为空时不退回历史内容。
 pub fn segments_since(files: &[(PathBuf, u64, u64)], now: u64, last_secs: u64) -> Vec<PathBuf> {
     if files.is_empty() {
         return Vec::new();
@@ -291,12 +332,6 @@ pub fn segments_since(files: &[(PathBuf, u64, u64)], now: u64, last_secs: u64) -
         .filter(|(_, _, mtime)| *mtime >= cutoff)
         .map(|(p, _, _)| p.clone())
         .collect();
-    if picked.is_empty() {
-        return files
-            .last()
-            .map(|(p, _, _)| vec![p.clone()])
-            .unwrap_or_default();
-    }
     picked
 }
 
@@ -337,8 +372,38 @@ pub fn export(
     out: &Path,
     net: NetOptions,
 ) -> Result<usize, String> {
-    let files = list_segments(dir);
-    let picked = segments_since(&files, now_secs(), last_secs);
+    export_cancellable(
+        ffmpeg,
+        dir,
+        last_secs,
+        out,
+        net,
+        &std::sync::atomic::AtomicBool::new(false),
+        std::time::Duration::from_secs(120),
+    )
+}
+
+/// 后台导出：进程运行与日志排空共用 timeout，取消或超时回收整个导出进程树。
+/// 错误输出最多保留 64 KiB；文件系统调用本身的阻塞不由此期限中断。
+/// 在同目录暂存，成功才替换目标；失败或取消保留已有目标并清理暂存文件。
+/// 选择片段至进程树回收期间保留源文件，完成、失败或取消均释放；仅协调本进程清理。
+pub fn export_cancellable(
+    ffmpeg: &str,
+    dir: &Path,
+    last_secs: u64,
+    out: &Path,
+    net: NetOptions,
+    cancel: &std::sync::atomic::AtomicBool,
+    timeout: std::time::Duration,
+) -> Result<usize, String> {
+    use std::io::Read;
+    use std::sync::atomic::Ordering;
+    use std::time::Instant;
+    if cancel.load(Ordering::Relaxed) {
+        return Err("导出已取消".into());
+    }
+    let retained = PinnedSegments::select(dir, last_secs)?;
+    let picked = &retained.0;
     if picked.is_empty() {
         return Ok(0);
     }
@@ -349,8 +414,19 @@ pub fn export(
         }
     }
     // 清单必须落在被拼接文件之外的地方没要求，但同盘的绝对路径最稳
-    let list_path = out.with_extension("concat.txt");
-    std::fs::write(&list_path, concat_list(&picked))
+    static EXPORT_ID: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+    let id = EXPORT_ID.fetch_add(1, Ordering::Relaxed);
+    let name = out
+        .file_stem()
+        .ok_or("导出目标必须是文件")?
+        .to_string_lossy();
+    let ext = out
+        .extension()
+        .and_then(|value| value.to_str())
+        .unwrap_or("mkv");
+    let staged = out.with_file_name(format!(".{name}.{}.{id}.part.{ext}", std::process::id()));
+    let list_path = staged.with_extension("concat.txt");
+    std::fs::write(&list_path, concat_list(picked))
         .map_err(|e| format!("写 concat 清单失败: {e}"))?;
 
     let mut cmd = Command::new(ffmpeg);
@@ -367,24 +443,100 @@ pub fn export(
         "-c",
         "copy",
         "-y",
-        &out.to_string_lossy(),
+        &staged.to_string_lossy(),
     ])
     .stdin(Stdio::null())
     .stdout(Stdio::null())
     .stderr(Stdio::piped());
     apply_net(&mut cmd, net);
-    // 同样走 spawn_managed：拼接进程也不能在父进程死后变孤儿
-    let status = crate::sys::spawn_managed(&mut cmd).and_then(|c| c.wait_with_output());
+    // 独立进程树仍受父进程保护，且可以单独取消包装程序及持有 stderr 的后代。
+    let result = (|| {
+        let started = Instant::now();
+        let interrupted = || {
+            if cancel.load(Ordering::Acquire) {
+                Some("导出已取消".to_string())
+            } else if started.elapsed() >= timeout {
+                Some("导出超时，已终止进程；请缩短导出时长后重试".to_string())
+            } else {
+                None
+            }
+        };
+        let mut process =
+            crate::sys::ProcessTree::spawn(&mut cmd).map_err(|e| format!("启动导出失败：{e}"))?;
+        let stderr = process.child.stderr.take();
+        let reader = std::thread::Builder::new()
+            .name("export-stderr".into())
+            .spawn(move || {
+                let mut retained = Vec::new();
+                if let Some(mut stderr) = stderr {
+                    let mut buf = [0; 4096];
+                    while let Ok(n) = stderr.read(&mut buf) {
+                        if n == 0 {
+                            break;
+                        }
+                        let keep = n.min(65536usize.saturating_sub(retained.len()));
+                        retained.extend_from_slice(&buf[..keep]);
+                    }
+                }
+                retained
+            });
+        let reader = match reader {
+            Ok(reader) => reader,
+            Err(e) => {
+                return Err(format!("启动导出日志线程失败：{e}"));
+            }
+        };
+        let mut status = None;
+        let result = loop {
+            if let Some(error) = interrupted() {
+                break Err(error);
+            }
+            if status.is_none() {
+                match process.child.try_wait() {
+                    Ok(value) => status = value,
+                    Err(e) => break Err(format!("等待导出失败：{e}")),
+                }
+            }
+            if let Some(status) = status {
+                if reader.is_finished() {
+                    break Ok(status);
+                }
+            }
+            std::thread::sleep(std::time::Duration::from_millis(20));
+        };
+        // 先关闭整棵进程树的管道写端，再 join；不能只 kill 已退出的包装进程。
+        process
+            .terminate()
+            .map_err(|e| format!("回收导出失败：{e}"))?;
+        let stderr = reader
+            .join()
+            .map_err(|_| "导出日志线程异常退出".to_string())?;
+        let status = result?;
+        if let Some(error) = interrupted() {
+            return Err(error);
+        }
+        if status.success() {
+            if !std::fs::metadata(&staged)
+                .map(|m| m.len() > 0)
+                .unwrap_or(false)
+            {
+                return Err("导出未生成有效文件，请检查缓存片段".into());
+            }
+            std::fs::rename(&staged, out)
+                .map_err(|e| format!("保存导出失败：{e}；已有文件保持不变"))?;
+            Ok(picked.len())
+        } else {
+            Err(format!(
+                "ffmpeg 拼接失败（{status}）：{}",
+                xd_core::onvif::mask_url_in_text(String::from_utf8_lossy(&stderr).trim())
+            ))
+        }
+    })();
     let _ = std::fs::remove_file(&list_path);
-    match status {
-        Ok(o) if o.status.success() => Ok(picked.len()),
-        Ok(o) => Err(format!(
-            "ffmpeg 拼接失败（退出码 {:?}）：{}",
-            o.status.code(),
-            xd_core::onvif::mask_url_in_text(String::from_utf8_lossy(&o.stderr).trim())
-        )),
-        Err(e) => Err(format!("运行 ffmpeg 失败: {e}")),
+    if result.is_err() {
+        let _ = std::fs::remove_file(&staged);
     }
+    result
 }
 
 fn now_secs() -> u64 {
@@ -404,6 +556,80 @@ fn now_ms() -> u128 {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn aged_segments(tag: &str) -> PathBuf {
+        let dir = std::env::temp_dir().join(format!("xdview-pins-{tag}-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        for name in ["a.mkv", "b.mkv", "c.mkv", "d.mkv"] {
+            let path = dir.join(name);
+            std::fs::write(&path, b"synthetic").unwrap();
+            std::fs::OpenOptions::new()
+                .write(true)
+                .open(path)
+                .unwrap()
+                .set_times(
+                    std::fs::FileTimes::new()
+                        .set_modified(SystemTime::now() - std::time::Duration::from_secs(60)),
+                )
+                .unwrap();
+        }
+        dir
+    }
+
+    #[test]
+    fn concurrent_exports_release_only_their_own_segment_pins() {
+        let dir = aged_segments("shared");
+        let other = aged_segments("other");
+        let first = PinnedSegments::select(&dir, 120).unwrap();
+        // 目录中包含 .. 的别名仍须命中相同的保留记录。
+        let alias = dir.join("..").join(dir.file_name().unwrap());
+        let second = PinnedSegments::select(&alias, 120).unwrap();
+        assert_eq!(prune_directory(&dir, Some(1)), 0);
+        assert_eq!(prune_directory(&other, Some(1)), 2, "其他目录正常清理");
+        drop(first);
+        let cleanup_dir = dir.clone();
+        assert_eq!(
+            std::thread::spawn(move || prune_directory(&cleanup_dir, Some(1)))
+                .join()
+                .unwrap(),
+            0
+        );
+        drop(second);
+        assert_eq!(prune_directory(&alias, Some(1)), 2);
+        assert!(!dir.join("a.mkv").exists());
+        std::fs::remove_dir_all(dir).unwrap();
+        std::fs::remove_dir_all(other).unwrap();
+    }
+
+    #[test]
+    fn failed_export_releases_pins_and_preserves_existing_output() {
+        let dir = aged_segments("failure");
+        let out = dir.join("existing.txt");
+        std::fs::write(&out, b"original").unwrap();
+        let result = export_cancellable(
+            &dir.join("missing-ffmpeg.exe").to_string_lossy(),
+            &dir,
+            120,
+            &out,
+            NetOptions::default(),
+            &std::sync::atomic::AtomicBool::new(false),
+            std::time::Duration::from_secs(1),
+        );
+        assert!(result.is_err());
+        assert_eq!(std::fs::read(&out).unwrap(), b"original");
+        assert_eq!(
+            std::fs::read_dir(&dir).unwrap().count(),
+            5,
+            "暂存清单须回收"
+        );
+        assert_eq!(prune_directory(&dir, Some(1)), 2, "错误返回也必须释放保留");
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn export_does_not_fall_back_to_expired_footage() {
+        assert!(segments_since(&[f("old.mkv", 100)], 10_000, 600).is_empty());
+    }
 
     fn f(name: &str, mtime: u64) -> (PathBuf, u64, u64) {
         (PathBuf::from(name), 1024, mtime)
@@ -454,13 +680,13 @@ mod tests {
     }
 
     #[test]
-    fn segments_since_picks_window_and_never_empty() {
+    fn segments_since_picks_only_requested_window() {
         let files = vec![f("a.mkv", 1000), f("b.mkv", 1100), f("c.mkv", 1200)];
         let picked = segments_since(&files, 1250, 100);
         assert_eq!(picked, vec![PathBuf::from("c.mkv")]);
-        // 全都过期时退回最新一个
+        // 全都过期时如实报告为空
         let picked = segments_since(&files, 99_999, 10);
-        assert_eq!(picked, vec![PathBuf::from("c.mkv")]);
+        assert!(picked.is_empty());
         assert!(segments_since(&[], 1, 1).is_empty());
     }
 

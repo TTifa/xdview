@@ -34,6 +34,8 @@ Rust 代码或依赖变化先执行 [基础门禁](../AGENTS.md#4-基础门禁�
 cargo test -p xd-media --test pipeline -- --ignored --nocapture
 # 本地切片和导出；显式排除真机收尾用例
 cargo test -p xd-media --test cache -- --ignored --nocapture --skip stop_finalizes_last_segment
+# Windows 专用父/子进程，验证句柄稳定与父进程异常退出；不操作用户应用
+cargo test -p xd-media --test process -- --ignored --exact job_lifecycle
 ```
 
 | 改动范围 | 追加验证 |
@@ -48,6 +50,26 @@ cargo test -p xd-media --test cache -- --ignored --nocapture --skip stop_finaliz
 | 配置 / XML / HTTP | 往返、转义、中文、空值、BOM、合法语法变体、截断与慢响应；专用测试配置配合 --check |
 
 上表是按风险选取的验收范围，不表示已有测试全部覆盖。具体设计契约见 [ARCHITECTURE.md](ARCHITECTURE.md) §4。
+
+本地 cache 追加用例覆盖手动录像 q 收尾后的真实可解码性/时长、拒绝收尾的进程超时回收、
+导出取消/超时及保留已有目标。拒绝收尾使用临时 cmd fixture，不连接设备。
+`export_deadline_covers_inherited_stderr` 使用包装脚本启动继承 stderr 的专用后代，
+验证根进程退出后仍响应超时/取消、后代结束且已有目标不被替换；`export_pipe_holder_fixture` 只供它启动。
+pipeline 的奇数 BMP 用例检查缩放后的实际像素与行边界；HTTP 单元测试使用真实本地 socket
+分次发送，覆盖 Content-Length/chunked 截断、读满不等待关闭和慢速响应总截止时间。
+无长度响应分别验证 EOF 成功和持续保持连接的明确失败；不以 XML 结束标签替代 HTTP 定界。
+background 单元测试覆盖取消代理、迟到资源在后台析构、串行任务执行顺序及未消费失败回执仍计为 pending；真实界面压力、
+缓存磁盘慢响应和设备断网仍需人工补充，不由这些单元测试替代。
+录像代理另覆盖同设备保留、切换设备/断开取消；关闭状态覆盖失败后仍有媒体 pending 时再次点击直接放行。
+Windows job_lifecycle 在独立 fixture 中加入普通外层 Job，验证嵌套启动；初始化失败重试由单元测试覆盖。
+Windows `atomic_write_preserves_protected_and_inherited_dacl` 单元测试通过系统 PowerShell 设置及读取合成文件 DACL，
+比较保存前后的访问规则与继承标志；默认测试因此也依赖 Windows PowerShell。
+`unreadable_dacl_refuses_save_without_changing_original_or_leaving_temporary` 通过 OWNER RIGHTS 拒绝读取 DACL，
+验证保存明确失败、原内容保留且临时文件回收，不能把权限读取失败当作目标不存在。
+缓存单元测试覆盖重叠导出引用计数、目录别名、其他目录正常清理及启动失败释放保留。
+本地 ignored 用例 `export_keeps_expired_segments_until_ffmpeg_finishes` 在包装脚本内设置读取屏障，
+让真实清理与导出并发，验证源片段保留、实际导出时长及结束后恢复清理。
+URL 脱敏单元测试覆盖合法标点密码、相邻／嵌套地址及嵌套在敏感查询值中的地址，歧义地址组整段遮盖。
 
 ## 4. 真机验证与排错
 
@@ -139,7 +161,7 @@ ffprobe -v error -show_entries format=duration -of default=nw=1:nk=1 $outFile
 把 `data_dir` 指到不可写位置（只读目录）时切主题，界面应正常切换，日志出现
 「主题偏好保存失败」且提示条说明下次启动可能恢复原主题；关窗等待期间写入失败时窗口应保留，
 提示可见后可再次关闭。连续快速切换后只保留最后一种，过期失败回执不应触发提示。
-写入持续阻塞超过 1.2 秒时，自动关闭请求不应重新进入等待；该上限仅约束偏好等待，不包含退出收尾。
+保存或媒体收尾持续阻塞超过六秒时，自动关闭请求不应重新进入等待；该上限统一约束保存与退出收尾。
 
 `--stats` 另输出一行 `[dbg]` 布局探针：`screen`（客户区）、`left_w/right_w`（分栏宽度）、
 `zoom`（数字变焦）、`mode`（Normal/Focus/Mini）、`fs`（视口全屏真值）；

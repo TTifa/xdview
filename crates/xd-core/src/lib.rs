@@ -8,6 +8,7 @@
 
 pub mod config;
 pub mod discovery;
+pub mod file_io;
 pub mod http;
 pub mod md5;
 pub mod model;
@@ -16,3 +17,25 @@ pub mod rtc_uri;
 pub mod sha1;
 
 pub use model::{Camera, Capabilities, Transport};
+
+/// 诊断 stdout 的统一脱敏边界，格式化设备回包与错误后再过滤 URL。
+#[macro_export]
+macro_rules! diagnostic_println {
+    () => { std::println!() };
+    ($($arg:tt)*) => { std::println!("{}", $crate::onvif::mask_url_in_text(&format!($($arg)*))) };
+}
+
+/// 诊断 stderr 的统一脱敏边界。
+#[macro_export]
+macro_rules! diagnostic_eprintln {
+    () => { std::eprintln!() };
+    ($($arg:tt)*) => { std::eprintln!("{}", $crate::onvif::mask_url_in_text(&format!($($arg)*))) };
+}
+
+#[cfg(test)]
+mod diagnostic_tests {
+    #[test]
+    fn empty_diagnostic_output_is_supported() {
+        crate::diagnostic_eprintln!();
+    }
+}

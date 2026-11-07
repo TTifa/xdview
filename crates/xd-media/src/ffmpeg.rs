@@ -119,7 +119,7 @@ pub fn probe(ffmpeg: &str, url: &str, net: NetOptions, cancel: &AtomicBool) -> O
     let mut child = match crate::sys::spawn_managed(&mut cmd) {
         Ok(c) => c,
         Err(e) => {
-            eprintln!("[probe] 启动 ffprobe 失败（{ffprobe}）：{e}");
+            xd_core::diagnostic_eprintln!("[probe] 启动 ffprobe 失败（{ffprobe}）：{e}");
             return None;
         }
     };
@@ -229,7 +229,7 @@ pub fn target_size(probe: Option<&ProbeInfo>, max_width: u32) -> (usize, usize, 
             let pw = p.width as usize;
             let ph = p.height as usize;
             if max_width == 0 || pw <= max_width as usize {
-                (even(pw), even(ph), false)
+                (even(pw), even(ph), pw != even(pw) || ph != even(ph))
             } else {
                 let w = even(max_width as usize);
                 let h = even(ph * w / pw.max(1));
@@ -337,9 +337,10 @@ pub fn decode_args(
     args
 }
 
-/// 录制参数：`-c copy` 直拷，容器用 mkv（进程被杀也不会坏文件头）。
+/// 录制参数：`-c copy` 直拷；保留 stdin，以便 q 正常写完 MKV 索引及时长。
 pub fn record_args(url: &str, output: &str, low_latency: bool, net: NetOptions) -> Vec<String> {
     let mut args = input_args(url, low_latency, net);
+    args.retain(|arg| arg != "-nostdin");
     args.push("-i".into());
     args.push(url.to_string());
     args.push("-map".into());
@@ -354,6 +355,18 @@ pub fn record_args(url: &str, output: &str, low_latency: bool, net: NetOptions) 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn odd_native_dimensions_require_actual_scaling() {
+        let probe = ProbeInfo {
+            width: 321,
+            height: 241,
+            codec: "bmp".into(),
+            fps: None,
+        };
+        assert_eq!(target_size(Some(&probe), 0), (320, 240, true));
+        assert_eq!(target_size(Some(&probe), 1280), (320, 240, true));
+    }
 
     #[test]
     fn ffprobe_derivation() {
@@ -394,7 +407,7 @@ mod tests {
             codec: "h265".into(),
             fps: None,
         };
-        assert_eq!(target_size(Some(&p), 0), (1920, 1080, false));
+        assert_eq!(target_size(Some(&p), 0), (1920, 1080, true));
     }
 
     #[test]

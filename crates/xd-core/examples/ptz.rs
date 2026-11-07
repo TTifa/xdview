@@ -19,6 +19,7 @@
 
 use std::time::Duration;
 use xd_core::onvif::{Credentials, OnvifClient, PtzStatus, Velocity};
+use xd_core::{diagnostic_eprintln as eprintln, diagnostic_println as println};
 
 /// 发一次 ContinuousMove、保持 `hold` 毫秒，然后读状态 —— **任何退出路径都会尝试 Stop**。
 ///
@@ -42,6 +43,10 @@ fn move_hold_stop(
 }
 
 fn main() -> Result<(), String> {
+    run().map_err(|e| xd_core::onvif::mask_url_in_text(&e))
+}
+
+fn run() -> Result<(), String> {
     let args: Vec<String> = std::env::args().skip(1).collect();
     if args.len() < 4 {
         return Err(

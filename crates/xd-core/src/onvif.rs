@@ -434,7 +434,7 @@ pub fn inject_credentials(uri: &str, user: &str, pass: &str) -> String {
     if !scheme.eq_ignore_ascii_case("rtsp") && !scheme.eq_ignore_ascii_case("rtsps") {
         return uri.to_string();
     }
-    let authority_end = rest.find('/').unwrap_or(rest.len());
+    let authority_end = rest.find(['/', '?', '#']).unwrap_or(rest.len());
     if rest[..authority_end].contains('@') {
         return uri.to_string(); // 已带凭据
     }
@@ -470,12 +470,21 @@ pub fn mask_credentials(url: &str) -> String {
 /// （`?...&secret=<32hex>`）同样属于敏感数据。日志、截图、诊断 CLI 输出前一律过一遍这里。
 ///
 /// 没匹配到 URL 时原样返回；对已脱敏的文本重复调用是幂等的。
+/// 无空白分隔的相邻／嵌套 URL 整组遮盖，避免歧义边界漏出内层凭据。
 pub fn mask_url_in_text(text: &str) -> String {
     let mut out = String::with_capacity(text.len());
     let mut rest = text;
     while let Some((start, end)) = next_url_range(rest) {
         out.push_str(&rest[..start]);
-        out.push_str(&mask_sensitive_query(&mask_credentials(&rest[start..end])));
+        let url = &rest[start..end];
+        // 没有空白分隔的相邻／嵌套地址无法可靠区分查询值与日志标点。
+        // 保守遮盖整个地址组，避免只处理外层 URL 而漏出内层凭据。
+        let after_scheme = url.find("://").map_or(url.len(), |i| i + 3);
+        if url[after_scheme..].contains("://") {
+            out.push_str("***");
+        } else {
+            out.push_str(&mask_sensitive_query(&mask_credentials(url)));
+        }
         rest = &rest[end..];
     }
     out.push_str(rest);
@@ -502,6 +511,19 @@ fn next_url_range(text: &str) -> Option<(usize, usize)> {
                 while end < text.len() && !is_url_boundary(bytes[end]) {
                     end += 1;
                 }
+                // ffmpeg 常以单引号包裹 URL；userinfo 内的单引号/括号则属于合法密码字符。
+                if start > 0 && bytes[start - 1] == b'\'' {
+                    if let Some(close) = text[start..end].rfind('\'').map(|offset| start + offset) {
+                        // 仅剥离包裹引号及其后的日志标点，不能把 userinfo 内的单引号当作结尾。
+                        if close > i + 3
+                            && bytes[close + 1..end]
+                                .iter()
+                                .all(|b| matches!(b, b':' | b',' | b';' | b')' | b']' | b'.'))
+                        {
+                            end = close;
+                        }
+                    }
+                }
                 if end > i + 3 {
                     return Some((start, end));
                 }
@@ -512,26 +534,9 @@ fn next_url_range(text: &str) -> Option<(usize, usize)> {
     None
 }
 
-/// URL 的终止字符：空白、引号、常见包裹符与分隔符。
+/// URL 的终止字符：空白及不允许直接出现的字符；合法密码/查询值中的标点不能截断脱敏。
 fn is_url_boundary(b: u8) -> bool {
-    b.is_ascii_whitespace()
-        || matches!(
-            b,
-            b'"' | b'\''
-                | b'<'
-                | b'>'
-                | b'`'
-                | b'('
-                | b')'
-                | b'['
-                | b']'
-                | b'{'
-                | b'}'
-                | b'|'
-                | b'\\'
-                | b','
-                | b';'
-        )
+    b.is_ascii_whitespace() || matches!(b, b'"' | b'<' | b'>' | b'`' | b'{' | b'}' | b'|' | b'\\')
 }
 
 /// 需要遮盖的查询参数名（比较时忽略大小写与 `[]` 后缀）。
@@ -913,10 +918,7 @@ pub fn elements<'a>(xml: &'a str, tag: &str) -> Vec<Elem<'a>> {
                 i = inner_end + close.len();
                 continue;
             }
-            out.push(Elem {
-                open: open_tag,
-                inner: &xml[open_end + 1..],
-            });
+            // 截断的目标元素不能作为有效数据返回。
         }
         i = open_end + 1;
     }
@@ -967,6 +969,58 @@ fn first_line(s: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn adjacent_and_nested_urls_never_expose_credentials() {
+        for urls in [
+            "http://first.invalid/path,rtsp://demo:synthetic-password@second.invalid/live",
+            "'http://first.invalid/path','rtsp://demo:synthetic-password@second.invalid/live'",
+            "http://first.invalid/?redirect=rtsp://demo:synthetic-password@second.invalid/live?token=synthetic-token",
+            "http://first.invalid/?token=http://synthetic-token.invalid/path",
+        ] {
+            let masked = mask_url_in_text(&format!("input {urls} end"));
+            assert!(!masked.contains("synthetic-password"), "{masked}");
+            assert!(!masked.contains("synthetic-token"), "{masked}");
+            assert!(masked.starts_with("input ") && masked.ends_with(" end"));
+            assert_eq!(mask_url_in_text(&masked), masked);
+        }
+    }
+
+    #[test]
+    fn quoted_sensitive_url_preserves_ffmpeg_log_punctuation() {
+        let output = mask_url_in_text(
+            "from 'rtsp://demo:test(pass)'word@camera.invalid/live?token=test(secret)':",
+        );
+        assert_eq!(
+            output,
+            "from 'rtsp://demo:***@camera.invalid/live?token=***':"
+        );
+    }
+
+    #[test]
+    fn unclosed_target_elements_are_not_returned_as_valid_text() {
+        assert!(elements("<Uri>rtsp://camera.invalid/live", "Uri").is_empty());
+        assert!(inner_text("<Name>truncated", "Name").is_none());
+        assert!(elements("<Profiles token=\"test\"><Name>ok</Name>", "Profiles").is_empty());
+        assert_eq!(
+            inner_text("<Uri>rtsp://camera.invalid/live</Uri>", "Uri").as_deref(),
+            Some("rtsp://camera.invalid/live")
+        );
+    }
+
+    #[test]
+    fn masks_legal_punctuation_in_url_passwords_and_signed_values() {
+        for password in ["demo(pass)", "demo,pass", "demo;pass", "demo'pass"] {
+            let text =
+                format!("input rtsp://audit:{password}@camera.invalid/live?token=test(secret)");
+            let masked = mask_url_in_text(&text);
+            assert!(!masked.contains(password), "必须遮盖整个密码：{masked}");
+            assert!(
+                !masked.contains("test(secret)"),
+                "必须遮盖整个签名：{masked}"
+            );
+        }
+    }
 
     #[test]
     fn compares_against_known_base64_digest_shape() {

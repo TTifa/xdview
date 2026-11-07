@@ -3,6 +3,7 @@
 //! 视觉基准是 `designs/xdview/XDView 交互原型.html`：深色面板体系、
 //! 三栏布局（设备 / 视频 / 控制，左右栏可拖拽调宽）、数字变焦、分级日志、右侧五个控制区块。
 
+use crate::background::{Background, Recorder, SegmentCache, Task};
 use crate::control::{Command, ControlLink, Feedback, Session, LEASE_RENEW};
 use crate::font;
 use crate::prefs::{PrefsWriter, Saved};
@@ -17,7 +18,7 @@ use xd_core::discovery::DiscoveredDevice;
 use xd_core::model::Camera;
 use xd_core::onvif::{Credentials, Preset, Profile, Velocity};
 use xd_media::stream::{Event, Stream, StreamOptions};
-use xd_media::{CacheOptions, Frame, NetOptions, Recorder, SegmentCache};
+use xd_media::{CacheOptions, Frame, NetOptions};
 
 // 色板见 `theme.rs`：夜间/日间两套，字段与原型 CSS 变量一一对应。
 // 绘制函数统一先 `let pal = self.pal;` 取一份副本，避免闭包里读字段和 `&mut self` 打架。
@@ -37,8 +38,8 @@ const MINI_OVERLAY_MARGIN: f32 = 8.0;
 const MINI_OVERLAY_BTN_H: f32 = 22.0;
 const OVERLAY_BUTTONS_W: f32 = 176.0;
 
-/// 关窗时等待最后一次偏好落盘的上限；超时就放弃——偏好可以丢一次，窗口不能关不掉。
-const CLOSE_DEFER_MAX: Duration = Duration::from_millis(1200);
+/// 正常关窗异步等待保存、媒体收尾和云台 Stop 的上限；再次关闭可立即退出。
+const CLOSE_DEFER_MAX: Duration = Duration::from_secs(6);
 
 /// 扫描弹窗正文的固定高度：扫描中 / 无结果 / 结果列表三种状态共用，
 /// 弹窗高度就不会随设备条数或状态变化而跳动。
@@ -258,7 +259,7 @@ impl Stats {
 #[derive(Default)]
 struct Preview {
     tex: Option<egui::TextureHandle>,
-    frame: Option<Frame>,
+    frame: Option<std::sync::Arc<Frame>>,
     paused: bool,
     /// 继续预览或媒体中断后，只有实际显示了新帧才能解除。
     waiting_for_frame: bool,
@@ -303,7 +304,7 @@ impl Preview {
         } else if let Some(t) = &mut self.tex {
             t.set(img, egui::TextureOptions::LINEAR);
         }
-        self.frame = Some(frame);
+        self.frame = Some(std::sync::Arc::new(frame));
         self.waiting_for_frame = false;
     }
 
@@ -352,7 +353,11 @@ pub struct XdView {
     cache: Option<SegmentCache>,
     /// 缓存进程意外退出后的重试时刻
     cache_retry_at: Option<Instant>,
-    cache_pruned_at: Option<Instant>,
+    background: Background,
+    config_source: std::sync::Arc<std::sync::Mutex<String>>,
+    export_task: Option<Task<Result<String, String>>>,
+    shutdown_at: Option<Instant>,
+    shutdown_stop: Option<std::sync::Arc<std::sync::atomic::AtomicBool>>,
     /// 云台转速档：0=低速 1=中速 2=高速（对应原型的转动速度下拉）
     ptz_speed_idx: usize,
     /// 当前 ONVIF 会话标识。切换设备/断开时用 `ControlLink::revoke` 换新的，
@@ -389,8 +394,6 @@ pub struct XdView {
     pending_restore: Option<(egui::Vec2, Option<egui::Pos2>)>,
     /// 首帧取得 DPI 后再校验并恢复启动位置。
     initial_position_pending: bool,
-    /// `on_exit` 没有 Context 参数，留一份句柄读取最后一帧视口几何
-    egui_ctx: egui::Context,
     /// 「添加设备」弹窗（手填 ONVIF 地址；小度/TP-Link 不支持 WS-Discovery，这是正路）
     add_open: bool,
     add_name: String,
@@ -405,10 +408,10 @@ pub struct XdView {
     /// 主题偏好由后台线程写盘，UI 只投递
     prefs: PrefsWriter,
     /// 最后一次投递的写序号；`Some` 表示「可能还没落盘」，关窗暂缓据此判断。
-    /// 写线程若意外退出，回执不会再来，`Some` 会一直留着——关窗仍有 1.2s 上限兜底。
+    /// 写线程若意外退出，回执不会再来，`Some` 会一直留着——关窗仍有六秒上限兜底。
     pending_theme: Option<u64>,
     /// 关窗暂缓的截止时刻：用户点了关闭，但最后一次写还没回来
-    close_deadline: Option<Instant>,
+    close_state: CloseState,
 }
 
 /// 转速档 → ContinuousMove 速度。
@@ -431,12 +434,14 @@ impl XdView {
     pub fn new(
         cc: &eframe::CreationContext<'_>,
         cfg: AppConfig,
+        config_source: String,
         cfg_path: PathBuf,
         storage: StoragePaths,
         geom: WindowGeom,
         theme: Theme,
-    ) -> Self {
+    ) -> Result<Self, String> {
         // 主题在 `main` 里（窗口创建前）读取并传进来，UI 线程不碰偏好文件。
+        let background = Background::new()?;
         let pal = Palette::of(theme);
         apply_theme(&cc.egui_ctx, theme);
         let cjk = font::find_cjk_font();
@@ -490,7 +495,11 @@ impl XdView {
             stats_tick: None,
             cache: None,
             cache_retry_at: None,
-            cache_pruned_at: None,
+            background,
+            config_source: std::sync::Arc::new(std::sync::Mutex::new(config_source)),
+            export_task: None,
+            shutdown_at: None,
+            shutdown_stop: None,
             ptz_speed_idx: 1,
             ptz_session: None,
             ptz_lease_at: None,
@@ -508,7 +517,6 @@ impl XdView {
             geom,
             pending_restore: None,
             initial_position_pending: true,
-            egui_ctx: cc.egui_ctx.clone(),
             add_open: false,
             add_name: String::new(),
             add_url: String::new(),
@@ -519,7 +527,7 @@ impl XdView {
             pal,
             prefs,
             pending_theme: None,
-            close_deadline: None,
+            close_state: CloseState::default(),
         };
         view.push_log(format!(
             "配置：{}（{} 路摄像机）",
@@ -528,7 +536,7 @@ impl XdView {
         ));
         view.push_log(format!("运行数据：{}", view.storage.root().display()));
         view.push_log(cjk_note);
-        view
+        Ok(view)
     }
 
     fn push_log(&mut self, msg: impl Into<String>) {
@@ -550,7 +558,7 @@ impl XdView {
     }
 
     fn toast(&mut self, msg: impl Into<String>) {
-        self.note = msg.into();
+        self.note = xd_core::onvif::mask_url_in_text(&msg.into());
         self.note_until = Some(Instant::now() + Duration::from_secs(4));
     }
 
@@ -645,9 +653,14 @@ impl XdView {
         let Some(cam) = self.current().cloned() else {
             return;
         };
+        self.export_task = None;
+        self.stop_recording_unless(Some(&cam.id));
         self.stop_cache(false);
         if let Some(mut s) = self.stream.take() {
-            s.stop();
+            self.background.submit(move || {
+                s.stop();
+                Ok(String::new())
+            });
         }
         // 换会话：上一台设备还在飞的 Connect/StreamUri 回执一律作废
         let session = self.control.revoke(cam.id.clone());
@@ -743,14 +756,13 @@ impl XdView {
                 self.push_lv(
                     Level::Ok,
                     format!(
-                        "开始缓存 → {}（保留最近 {} 分钟，每片 {} 秒）",
+                        "已请求缓存 → {}（保留最近 {} 分钟，每片 {} 秒）",
                         c.dir().display(),
                         self.cfg.settings.cache_minutes,
                         self.cfg.settings.cache_segment_secs
                     ),
                 );
                 self.cache = Some(c);
-                self.cache_pruned_at = Some(Instant::now());
             }
             Err(e) => {
                 self.push_lv(Level::Err, format!("缓存启动失败：{e}"));
@@ -765,7 +777,7 @@ impl XdView {
             let dir = c.dir().to_path_buf();
             c.stop();
             if log {
-                self.push_log(format!("已停止缓存（片段在 {}）", dir.display()));
+                self.push_log(format!("已请求停止缓存（片段在 {}）", dir.display()));
             }
         }
     }
@@ -778,38 +790,61 @@ impl XdView {
         }
     }
 
-    /// 每 15 秒清一次过期片段；进程挂了就 3 秒后重启。
+    fn poll_background(&mut self) -> bool {
+        let mut failed = false;
+        while let Some(result) = self.background.try_recv() {
+            failed |= self.report_background(result);
+        }
+        if let Some(result) = self.recorder.as_ref().and_then(|rec| rec.poll()) {
+            self.recorder = None;
+            failed |= self
+                .report_background(result.map(|path| format!("录像已保存 → {}", path.display())));
+        }
+        let result = self.export_task.as_ref().map(|task| task.try_recv());
+        match result {
+            Some(Ok(result)) => {
+                self.export_task = None;
+                failed |= self.report_background(result);
+            }
+            Some(Err(std::sync::mpsc::TryRecvError::Disconnected)) => {
+                self.export_task = None;
+                failed |= self.report_background(Err("导出后台任务异常退出".into()));
+            }
+            _ => {}
+        }
+        failed
+    }
+
+    fn report_background(&mut self, result: Result<String, String>) -> bool {
+        let failed = result.is_err();
+        match result {
+            Ok(message) if !message.is_empty() => {
+                self.push_lv(Level::Ok, message.clone());
+                self.toast(message);
+            }
+            Err(error) => {
+                self.push_lv(Level::Err, error.clone());
+                self.toast(error);
+            }
+            _ => {}
+        }
+        failed
+    }
+
+    /// 轮询内存回执，目录统计和清理均在缓存线程执行。
     fn poll_cache(&mut self) {
-        if self.cache.is_some() {
-            let exited = self
-                .cache
-                .as_mut()
-                .map(|c| c.poll().is_some())
-                .unwrap_or(false);
-            if exited {
-                self.cache = None;
-                self.push_lv(Level::Warn, "缓存进程已退出（流可能断了），3 秒后重试");
-                self.cache_retry_at = Some(Instant::now() + std::time::Duration::from_secs(3));
-                return;
+        let result = self.cache.as_ref().and_then(|cache| cache.poll());
+        if let Some(result) = result {
+            self.cache = None;
+            if let Err(e) = result {
+                self.push_lv(Level::Err, e);
             }
-            let due = self
-                .cache_pruned_at
-                .map(|t| t.elapsed().as_secs() >= 15)
-                .unwrap_or(true);
-            if due {
-                self.cache_pruned_at = Some(Instant::now());
-                if let Some(c) = &self.cache {
-                    let n = c.prune();
-                    if n > 0 {
-                        self.push_log(format!("清理过期缓存 {n} 个片段"));
-                    }
-                }
-            }
-        } else if let Some(at) = self.cache_retry_at {
-            if Instant::now() >= at {
-                self.cache_retry_at = None;
-                self.start_cache();
-            }
+            self.push_lv(Level::Warn, "缓存已退出，3 秒后重试");
+            self.cache_retry_at = Some(Instant::now() + Duration::from_secs(3));
+        } else if self.cache.is_none() && self.cache_retry_at.is_some_and(|at| Instant::now() >= at)
+        {
+            self.cache_retry_at = None;
+            self.start_cache();
         }
     }
 
@@ -825,22 +860,32 @@ impl XdView {
             &self.storage.exports(),
             &format!("{cam_id}_last{minutes}m"),
         );
-        match xd_media::cache::export(
-            &self.cfg.settings.ffmpeg,
-            &dir,
-            minutes * 60,
-            &out,
-            self.net_options(),
+        if self.export_task.is_some() {
+            self.toast("导出正在进行，请稍候");
+            return;
+        }
+        let ffmpeg = self.cfg.settings.ffmpeg.clone();
+        let net = self.net_options();
+        match Task::start(
+            "xdview-export",
+            move |cancel| match xd_media::cache::export_cancellable(
+                &ffmpeg,
+                &dir,
+                minutes.saturating_mul(60),
+                &out,
+                net,
+                &cancel,
+                Duration::from_secs(120),
+            )? {
+                0 => Err("指定时段没有可导出的片段，请等待缓存产生新片段".into()),
+                n => Ok(format!("导出 {n} 个片段 → {}", out.display())),
+            },
         ) {
-            Ok(0) => self.toast("还没有可导出的片段，等一会儿再试"),
-            Ok(n) => {
-                self.push_lv(Level::Ok, format!("导出 {n} 个片段 → {}", out.display()));
-                self.toast(format!("已导出到 {}", out.display()));
+            Ok(task) => {
+                self.export_task = Some(task);
+                self.toast("正在导出缓存…");
             }
-            Err(e) => {
-                self.push_lv(Level::Err, format!("导出失败：{e}"));
-                self.toast("导出失败，看日志");
-            }
+            Err(e) => self.toast(e),
         }
     }
 
@@ -849,7 +894,10 @@ impl XdView {
         // 换码流/清晰度与重新连接都开始新预览，不能沿用上一会话的暂停帧。
         self.preview = Preview::default();
         if let Some(mut s) = self.stream.take() {
-            s.stop();
+            self.background.submit(move || {
+                s.stop();
+                Ok(String::new())
+            });
         }
         let opts = StreamOptions {
             url: url.to_string(),
@@ -896,11 +944,16 @@ impl XdView {
 
     /// 把当前配置写回 config.toml（新增/导入设备、改设置后调用，重启不丢）。
     fn persist_config(&mut self) {
-        let text = xd_core::config::app_config_to_toml(&self.cfg);
-        match std::fs::write(&self.cfg_path, &text) {
-            Ok(_) => self.push_log(format!("配置已保存 → {}", self.cfg_path.display())),
-            Err(e) => self.push_lv(Level::Err, format!("保存配置失败: {e}")),
-        }
+        let config = self.cfg.clone();
+        let path = self.cfg_path.clone();
+        let source = std::sync::Arc::clone(&self.config_source);
+        self.background.submit(move || {
+            let mut source = source
+                .lock()
+                .map_err(|_| "配置保存状态异常，请重启后重试".to_string())?;
+            *source = xd_core::config::save_if_unchanged(&path, &config, &source)?;
+            Ok(format!("配置已保存 → {}", path.display()))
+        });
     }
 
     /// 手填 ONVIF 地址添加设备并立即连接。
@@ -1027,11 +1080,23 @@ impl XdView {
         self.connect_selected();
     }
 
+    /// None 表示主动断开，Some 表示切换目标；同设备预览重连保留独立录像。
+    fn stop_recording_unless(&mut self, device: Option<&str>) {
+        if let Some(recorder) = &mut self.recorder {
+            recorder.stop_unless_device(device);
+        }
+    }
+
     fn disconnect(&mut self, log: bool) {
+        self.stop_recording_unless(None);
+        self.export_task = None;
         self.preview = Preview::default();
         self.stop_cache(false);
         if let Some(mut s) = self.stream.take() {
-            s.stop();
+            self.background.submit(move || {
+                s.stop();
+                Ok(String::new())
+            });
         }
         // 递增代次：断开后迟到的回执不能再改配置或起播
         self.control.revoke(String::new());
@@ -1280,26 +1345,21 @@ impl XdView {
             .replace([':', 'T'], "-")
             .replace('Z', "");
         let path = self.storage.snapshot(&id, &stamp);
-        if let Some(dir) = path.parent() {
-            if let Err(e) = std::fs::create_dir_all(dir) {
-                self.toast(format!("无法创建截图目录：{e}；请检查权限或修改 data_dir"));
-                return;
+        let frame = std::sync::Arc::clone(frame);
+        self.background.submit(move || {
+            if let Some(dir) = path.parent() {
+                std::fs::create_dir_all(dir)
+                    .map_err(|e| format!("无法创建截图目录：{e}；请检查权限或修改 data_dir"))?;
             }
-        }
-        match std::fs::write(&path, frame.to_bmp()) {
-            Ok(_) => {
-                self.push_lv(Level::Ok, format!("截图已保存 → {}", path.display()));
-                self.toast(format!("截图已保存 {}", path.display()));
-            }
-            Err(e) => self.toast(format!("截图失败：{e}")),
-        }
+            xd_core::file_io::write_atomic(&path, &frame.to_bmp())?;
+            Ok(format!("截图已保存 → {}", path.display()))
+        });
     }
 
     fn toggle_record(&mut self) {
-        if let Some(rec) = self.recorder.take() {
-            let p = rec.stop();
-            self.push_lv(Level::Ok, format!("录像结束：{}", p.display()));
-            self.toast(format!("录像保存到 {}", p.display()));
+        if let Some(rec) = &mut self.recorder {
+            rec.stop();
+            self.toast("正在收尾录像…");
             return;
         }
         let Some(cam) = self.current().cloned() else {
@@ -1308,6 +1368,7 @@ impl XdView {
         let url = cam.resolved_url(self.high_stream);
         let out = xd_media::record::default_record_path(&self.storage.recordings(), &cam.id);
         match Recorder::start(
+            cam.id,
             &self.cfg.settings.ffmpeg,
             &url,
             &out,
@@ -1315,7 +1376,7 @@ impl XdView {
             self.net_options(),
         ) {
             Ok(r) => {
-                self.push_lv(Level::Ok, format!("开始录像 → {}", out.display()));
+                self.push_lv(Level::Ok, format!("已请求录像 → {}", out.display()));
                 self.recorder = Some(r);
             }
             Err(e) => self.toast(e),
@@ -1424,20 +1485,49 @@ impl XdView {
         failed
     }
 
-    /// 点关闭时若最后一次偏好写还在路上，最多等 [`CLOSE_DEFER_MAX`]。
-    ///
-    /// 暂缓期间界面照常响应（不 join、不阻塞），写回执或超时后再真正关闭。
-    /// 暂缓期内再点一次关闭视为「坚持要关」，直接放行——不能让用户觉得窗口关不掉。
+    /// 关窗先请求后台收尾，使用统一的有界暂缓状态机；不等待线程或网络。
     fn guard_close(&mut self, ctx: &egui::Context, save_failed: bool) {
         let requested = ctx.input(|i| i.viewport().close_requested());
         let now = Instant::now();
-        match advance_close(
-            &mut self.close_deadline,
-            requested,
-            self.pending_theme.is_some(),
-            now,
-            save_failed,
-        ) {
+        if requested && self.shutdown_at.is_none() {
+            let ctx_copy = ctx.clone();
+            match self.view_mode {
+                ViewMode::Normal if self.pending_restore.is_none() => {
+                    self.snapshot_geom(&ctx_copy, GeomSlot::Win)
+                }
+                ViewMode::Mini => self.snapshot_geom(&ctx_copy, GeomSlot::Mini),
+                _ => {}
+            }
+            let geom = self.geom;
+            let root = self.storage.root().to_path_buf();
+            self.background.submit(move || {
+                geom.save(&root)?;
+                Ok(String::new())
+            });
+            self.shutdown_stop = Some(self.control.request_stop());
+            self.export_task = None;
+            self.stop_cache(false);
+            if let Some(rec) = &mut self.recorder {
+                rec.stop();
+            }
+            if let Some(mut stream) = self.stream.take() {
+                self.background.submit(move || {
+                    stream.stop();
+                    Ok(String::new())
+                });
+            }
+            self.shutdown_at = Some(now);
+        }
+        let pending = self.pending_theme.is_some()
+            || (self.shutdown_at.is_some()
+                && (self.background.pending()
+                    || self.recorder.is_some()
+                    || crate::background::active() != 0
+                    || !self
+                        .shutdown_stop
+                        .as_ref()
+                        .is_some_and(|done| done.load(std::sync::atomic::Ordering::Acquire))));
+        match advance_close(&mut self.close_state, requested, pending, now, save_failed) {
             // 没有待落盘的写，或用户在暂缓期间再次点关闭：不拦
             CloseAction::Pass => {}
             CloseAction::Defer => {
@@ -1534,16 +1624,11 @@ impl XdView {
     fn save_devices_file(&mut self) {
         let text = xd_core::config::cameras_to_toml(&self.cfg.cameras);
         let path = self.storage.devices_export();
-        match std::fs::write(&path, &text) {
-            Ok(_) => {
-                self.ie_text = text;
-                self.push_lv(Level::Ok, format!("设备已导出 → {}", path.display()));
-                self.toast(format!("已导出到 {}", path.display()));
-            }
-            Err(e) => {
-                self.ie_error = format!("写文件失败：{e}");
-            }
-        }
+        self.ie_text = text.clone();
+        self.background.submit(move || {
+            xd_core::file_io::write_atomic(&path, text.as_bytes())?;
+            Ok(format!("设备已导出 → {}", path.display()))
+        });
     }
 }
 
@@ -3082,24 +3167,19 @@ impl XdView {
                     self.snapshot();
                 }
                 ui.add_space(8.0);
-                let label = if recording { "停止" } else { "录像" };
+                let label = if self.recorder.as_ref().is_some_and(|rec| rec.stopping()) {
+                    "收尾中"
+                } else if recording {
+                    "停止"
+                } else {
+                    "录像"
+                };
                 if cap_btn(ui, &pal, cw, label, "MKV · 不重编码", recording).clicked() {
                     self.toggle_record();
                 }
             });
-            let mut record_ended = false;
-            let mut record_secs = 0u64;
-            if let Some(rec) = &mut self.recorder {
-                if rec.poll().is_some() {
-                    record_ended = true;
-                } else {
-                    record_secs = rec.elapsed_secs();
-                }
-            }
-            if record_ended {
-                self.recorder = None;
-                self.push_lv(Level::Warn, "录像进程已退出");
-            } else if self.recorder.is_some() {
+            let record_secs = self.recorder.as_ref().map_or(0, |rec| rec.elapsed_secs());
+            if self.recorder.is_some() {
                 ui.add_space(6.0);
                 ui.label(
                     egui::RichText::new(format!("● REC  {}", fmt_duration(record_secs)))
@@ -3132,7 +3212,11 @@ impl XdView {
                                 egui::vec2(left_w, 16.0),
                                 egui::Label::new(
                                     egui::RichText::new(if on {
-                                        "运行中 · 切片落盘"
+                                        if self.cache.as_ref().is_some_and(|cache| cache.ready()) {
+                                            "运行中 · 切片落盘"
+                                        } else {
+                                            "正在启动…"
+                                        }
                                     } else {
                                         "已关闭"
                                     })
@@ -3720,8 +3804,22 @@ impl XdView {
 
 impl eframe::App for XdView {
     fn update(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
-        let save_failed = self.poll_prefs();
+        let background_failed = self.poll_background();
+        let save_failed = self.poll_prefs() || background_failed;
         self.guard_close(ctx, save_failed);
+        if self.shutdown_at.is_some() {
+            ctx.request_repaint_after(Duration::from_millis(50));
+            egui::CentralPanel::default().show(ctx, |ui| {
+                ui.label("正在收尾录像、缓存和保存配置…");
+                if !self.note.is_empty() {
+                    ui.label(&self.note);
+                }
+                if ui.button("立即退出").clicked() {
+                    ctx.send_viewport_cmd(egui::ViewportCommand::Close);
+                }
+            });
+            return;
+        }
         if self.autostart {
             self.autostart = false;
             if self.stream.is_none() && !self.cfg.cameras.is_empty() {
@@ -3804,36 +3902,14 @@ impl eframe::App for XdView {
         }
     }
 
-    /// 窗口关闭时收尾。
-    ///
-    /// 实测：eframe 退出**不保证**跑 `Drop`，若只靠析构，ffmpeg 子进程会被作业对象硬杀，
-    /// 最后一片的时长元数据就是错的（实测出现过 393s 的假时长）。
-    /// 这里显式停掉缓存/录像，让 ffmpeg 把当前片写完整。
+    /// 退出兜底只发取消；正常关窗的后台等待由 guard_close 完成。
     fn on_exit(&mut self, _gl: Option<&eframe::glow::Context>) {
-        // 只置停机标志，不 join：线程收尾不该把阻塞带回退出路径
         self.prefs.shutdown();
-        // 窗口几何退出时写一次独立文件，不覆写 config.toml（保留用户注释与外部编辑）。
-        // 专注态尺寸不代表主窗口，只在 Normal / Mini 两态记录。
-        let ctx = self.egui_ctx.clone();
-        match self.view_mode {
-            // 恢复命令还没被下一帧确认时，视口可能是撑大过程中的中间尺寸，别写进 win 槽
-            ViewMode::Normal if self.pending_restore.is_none() => {
-                self.snapshot_geom(&ctx, GeomSlot::Win)
-            }
-            ViewMode::Mini => self.snapshot_geom(&ctx, GeomSlot::Mini),
-            _ => {}
-        }
-        if let Err(e) = self.geom.save(self.storage.root()) {
-            eprintln!("{e}；下次启动将沿用上次的窗口位置");
-        }
+        // 正常关闭已经过异步收尾；强制关闭只发送取消，Job 负责最后的兜底。
+        self.export_task = None;
         self.stop_cache(false);
-        if let Some(rec) = self.recorder.take() {
-            let _ = rec.stop();
-        }
-        // 云台必须在进程结束前停下：退出后队列里的 Stop 就没机会发到设备上了。
-        // 等待要有界 —— 设备可能已经断网，HTTP 超时本身就要 5 秒。
-        if !self.control.stop_and_wait(Duration::from_millis(1500)) {
-            eprintln!("[退出] 云台 Stop 未能在 1.5s 内完成（设备侧租约到期后会自行停止）");
+        if let Some(rec) = &mut self.recorder {
+            rec.stop();
         }
         self.disconnect(false);
     }
@@ -3994,34 +4070,35 @@ fn take_latest_save(pending: &mut Option<u64>, saved: Saved) -> Option<Saved> {
     Some(saved)
 }
 
-fn close_action_after_save(
-    requested: bool,
-    pending: bool,
+/// 保存失败与普通等待分开记录，用户再次关闭必须直接放行。
+#[derive(Debug, Default)]
+struct CloseState {
     deadline: Option<Instant>,
-    now: Instant,
-    save_failed: bool,
-) -> CloseAction {
-    if save_failed && (requested || deadline.is_some()) {
-        CloseAction::ShowFailure
-    } else {
-        close_action(requested, pending, deadline, now)
-    }
+    failed: bool,
 }
 
-/// 更新关窗等待状态，视口命令由调用方按返回值发送。
+/// 更新关窗状态；失败后保留窗口，后续的明确关闭优先于任何待处理任务。
 fn advance_close(
-    deadline: &mut Option<Instant>,
+    state: &mut CloseState,
     requested: bool,
     pending: bool,
     now: Instant,
     save_failed: bool,
 ) -> CloseAction {
-    let action = close_action_after_save(requested, pending, *deadline, now, save_failed);
-    match action {
-        CloseAction::Defer => *deadline = Some(now + CLOSE_DEFER_MAX),
-        CloseAction::ShowFailure => *deadline = None,
-        // Close 会在下一帧变成关闭请求；保留截止时间，让该请求直接放行。
-        CloseAction::CloseNow | CloseAction::Pass | CloseAction::Wait => {}
+    if requested && (state.failed || state.deadline.is_some()) {
+        return CloseAction::Pass;
+    }
+    if state.failed {
+        return CloseAction::Pass;
+    }
+    if save_failed && (requested || state.deadline.is_some()) {
+        state.failed = true;
+        state.deadline = None;
+        return CloseAction::ShowFailure;
+    }
+    let action = close_action(requested, pending, state.deadline, now);
+    if action == CloseAction::Defer {
+        state.deadline = Some(now + CLOSE_DEFER_MAX);
     }
     action
 }
@@ -4810,7 +4887,7 @@ mod tests {
     #[test]
     fn timeout_close_request_is_not_deferred_again() {
         let start = Instant::now();
-        let mut deadline = None;
+        let mut deadline = CloseState::default();
         assert_eq!(
             advance_close(&mut deadline, true, true, start, false),
             CloseAction::Defer
@@ -4828,9 +4905,27 @@ mod tests {
     }
 
     #[test]
+    fn retry_close_after_save_failure_passes_even_while_media_is_pending() {
+        let now = Instant::now();
+        let mut state = CloseState::default();
+        assert_eq!(
+            advance_close(&mut state, true, true, now, false),
+            CloseAction::Defer
+        );
+        assert_eq!(
+            advance_close(&mut state, false, true, now, true),
+            CloseAction::ShowFailure
+        );
+        assert_eq!(
+            advance_close(&mut state, true, true, now, false),
+            CloseAction::Pass
+        );
+    }
+
+    #[test]
     fn save_result_completes_or_cancels_close_wait() {
         let start = Instant::now();
-        let mut deadline = None;
+        let mut deadline = CloseState::default();
         assert_eq!(
             advance_close(&mut deadline, true, true, start, false),
             CloseAction::Defer
@@ -4844,7 +4939,7 @@ mod tests {
             CloseAction::Pass
         );
 
-        let mut deadline = None;
+        let mut deadline = CloseState::default();
         assert_eq!(
             advance_close(&mut deadline, true, true, start, false),
             CloseAction::Defer
@@ -4853,7 +4948,7 @@ mod tests {
             advance_close(&mut deadline, false, false, start, true),
             CloseAction::ShowFailure
         );
-        assert_eq!(deadline, None);
+        assert_eq!(deadline.deadline, None);
         assert_eq!(
             advance_close(&mut deadline, true, false, start, false),
             CloseAction::Pass
@@ -4885,22 +4980,22 @@ mod tests {
     #[test]
     fn failed_save_keeps_closing_window_open_until_user_retries() {
         let now = Instant::now();
-        let deadline = Some(now + CLOSE_DEFER_MAX);
+        let mut state = CloseState::default();
         assert_eq!(
-            close_action_after_save(false, false, deadline, now, true),
+            advance_close(&mut state, true, true, now, false),
+            CloseAction::Defer
+        );
+        assert_eq!(
+            advance_close(&mut state, false, true, now, true),
             CloseAction::ShowFailure
         );
         assert_eq!(
-            close_action_after_save(true, false, None, now, true),
-            CloseAction::ShowFailure
-        );
-        assert_eq!(
-            close_action_after_save(true, false, None, now, false),
+            advance_close(&mut state, false, false, now + CLOSE_DEFER_MAX, false),
             CloseAction::Pass
         );
         assert_eq!(
-            close_action_after_save(false, false, deadline, now, false),
-            CloseAction::CloseNow
+            advance_close(&mut state, true, true, now, true),
+            CloseAction::Pass
         );
     }
 

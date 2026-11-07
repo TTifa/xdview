@@ -20,11 +20,11 @@
 //! [`LEASE_RENEW`] 续租。这样即使 UI 崩溃、进程被杀或 Stop 丢失，镜头最多多转一个租约
 //! 就自己停下，不会无限转下去。
 
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc::{channel, Receiver, RecvTimeoutError, Sender, TryRecvError};
 use std::sync::Arc;
 use std::thread;
-use std::time::{Duration, Instant};
+use std::time::Duration;
 use xd_core::discovery::{self, discover, DiscoveredDevice};
 use xd_core::onvif::{Credentials, OnvifClient, Preset, Profile, Velocity};
 
@@ -64,6 +64,8 @@ pub enum Command {
     /// 走抢占通道，且**刻意不带会话**：它必须在任何情况下生效，包括会话已作废时 ——
     /// 会话作废往往意味着 UI 已经切走或断开，那时更该把镜头停下，这正是兜底的意义。
     Stop,
+    /// 退出专用确认：只有这条 Stop 实际执行完才置位。
+    StopForExit(Arc<AtomicBool>),
     GotoPreset(Session, String),
     /// 在当前位置保存预置位（参数为名称）
     SetPreset(Session, String),
@@ -134,9 +136,6 @@ pub struct ControlLink {
     urgent: Sender<Command>,
     rx: Receiver<Feedback>,
     generation: u64,
-    /// worker 已处理过的 Stop 次数。退出路径用它做有界等待，
-    /// 否则进程一结束 Stop 就没机会发到设备上了。
-    stops: Arc<AtomicU64>,
 }
 
 impl ControlLink {
@@ -144,12 +143,9 @@ impl ControlLink {
         let (cmd_tx, cmd_rx) = channel::<Command>();
         let (urgent_tx, urgent_rx) = channel::<Command>();
         let (out_tx, out_rx) = channel::<Feedback>();
-        let stops = Arc::new(AtomicU64::new(0));
-
-        let worker_stops = Arc::clone(&stops);
         thread::Builder::new()
             .name("onvif".to_string())
-            .spawn(move || worker(cmd_rx, urgent_rx, out_tx, worker_stops))
+            .spawn(move || worker(cmd_rx, urgent_rx, out_tx))
             .expect("无法创建 ONVIF 线程");
 
         ControlLink {
@@ -157,25 +153,14 @@ impl ControlLink {
             urgent: urgent_tx,
             rx: out_rx,
             generation: 0,
-            stops,
         }
     }
 
-    /// 下发 Stop 并**有界等待** worker 真的执行过一次。返回是否在超时前等到。
-    ///
-    /// 退出路径专用：进程一结束，队列里的 Stop 就没机会发到设备上了，镜头会继续转；
-    /// 但也不能无限等 —— 设备可能已经断网，HTTP 超时本身就要 5 秒。
-    pub fn stop_and_wait(&self, timeout: Duration) -> bool {
-        let before = self.stops.load(Ordering::SeqCst);
-        self.send(Command::Stop);
-        let deadline = Instant::now() + timeout;
-        while Instant::now() < deadline {
-            if self.stops.load(Ordering::SeqCst) != before {
-                return true;
-            }
-            thread::sleep(Duration::from_millis(20));
-        }
-        false
+    /// 下发退出用 Stop，返回独立回执；UI 后续帧查询，不等待网络。
+    pub fn request_stop(&self) -> Arc<AtomicBool> {
+        let done = Arc::new(AtomicBool::new(false));
+        self.send(Command::StopForExit(Arc::clone(&done)));
+        done
     }
 
     /// 让在途命令与回执全部作废，返回新会话的标识。
@@ -201,7 +186,7 @@ impl ControlLink {
     pub fn send(&self, cmd: Command) {
         // 停止/断开必须能插到扫描、连接前面，否则松开方向键后镜头还会继续转
         let tx = match &cmd {
-            Command::Stop | Command::Disconnect => &self.urgent,
+            Command::Stop | Command::StopForExit(_) | Command::Disconnect => &self.urgent,
             _ => &self.cmd,
         };
         let _ = tx.send(cmd);
@@ -217,7 +202,6 @@ struct Worker {
     client: Option<OnvifClient>,
     profile: Option<String>,
     active: Option<Session>,
-    stops: Arc<AtomicU64>,
 }
 
 impl Worker {
@@ -226,13 +210,11 @@ impl Worker {
         self.active.as_ref() == Some(session)
     }
 
-    /// 尽力停止当前会话的云台。无论有没有可停的会话都记一次，
-    /// 好让 [`ControlLink::stop_and_wait`] 不会因为"无事可做"而空等到超时。
+    /// 尽力停止当前会话的云台；退出确认由独立 StopForExit 命令负责。
     fn stop(&self) {
         if let (Some(c), Some(p)) = (self.client.as_ref(), self.profile.as_deref()) {
             let _ = c.stop(p);
         }
-        self.stops.fetch_add(1, Ordering::SeqCst);
     }
 
     /// 断开：先尝试 Stop（断开不等于希望镜头继续转），再清空会话。
@@ -255,17 +237,11 @@ enum Next {
     Closed,
 }
 
-fn worker(
-    cmd_rx: Receiver<Command>,
-    urgent_rx: Receiver<Command>,
-    tx: Sender<Feedback>,
-    stops: Arc<AtomicU64>,
-) {
+fn worker(cmd_rx: Receiver<Command>, urgent_rx: Receiver<Command>, tx: Sender<Feedback>) {
     let mut w = Worker {
         client: None,
         profile: None,
         active: None,
-        stops,
     };
 
     loop {
@@ -388,6 +364,10 @@ impl Worker {
             }
             // Stop 无条件执行：会话过期说明 UI 已切走或断开，此时更该把镜头停下
             Command::Stop => self.stop(),
+            Command::StopForExit(done) => {
+                self.stop();
+                done.store(true, Ordering::Release);
+            }
             Command::GotoPreset(session, token) => {
                 if !self.matches(&session) {
                     return;
@@ -474,6 +454,10 @@ impl Worker {
     fn apply_urgent(&mut self, cmd: Command) {
         match cmd {
             Command::Stop => self.stop(),
+            Command::StopForExit(done) => {
+                self.stop();
+                done.store(true, Ordering::Release);
+            }
             Command::Disconnect => self.teardown(),
             _ => {}
         }
@@ -573,7 +557,6 @@ mod tests {
             client: None,
             profile: None,
             active: None,
-            stops: Arc::new(AtomicU64::new(0)),
         };
         let (tx, rx) = channel::<Feedback>();
         let (_utx, urx) = channel::<Command>();

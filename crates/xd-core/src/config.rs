@@ -23,6 +23,9 @@
 
 use crate::model::{Camera, Capabilities};
 
+/// 配置文本上限（含设备导入），避免不受限的读取与解析分配。
+pub const MAX_CONFIG_BYTES: usize = 1024 * 1024;
+
 #[derive(Debug, Clone)]
 pub struct Settings {
     pub ffmpeg: String,
@@ -121,6 +124,10 @@ fn get_str(table: &Table, key: &str) -> Option<String> {
 }
 
 pub fn parse(text: &str) -> Result<AppConfig, String> {
+    if text.len() > MAX_CONFIG_BYTES {
+        return Err("配置超过 1 MiB，请减少设备数量或无关内容".into());
+    }
+    let text = text.strip_prefix('\u{feff}').unwrap_or(text);
     let mut cameras: Vec<Table> = Vec::new();
     let mut settings_table: Table = Vec::new();
     let mut section = Section::Root;
@@ -151,7 +158,7 @@ pub fn parse(text: &str) -> Result<AppConfig, String> {
         }
         let (key, value) = line
             .split_once('=')
-            .ok_or_else(|| format!("第 {} 行：缺少 '='：{}", lineno + 1, line))?;
+            .ok_or_else(|| format!("第 {} 行：缺少 '='", lineno + 1))?;
         let key = key.trim().to_string();
         let value = parse_value(value.trim())
             .map_err(|e| format!("第 {} 行 `{}`：{}", lineno + 1, key, e))?;
@@ -254,8 +261,14 @@ enum Section {
 
 fn strip_comment(line: &str) -> &str {
     let mut in_quote = false;
+    let mut escaped = false;
     for (i, ch) in line.char_indices() {
+        if in_quote && escaped {
+            escaped = false;
+            continue;
+        }
         match ch {
+            '\\' if in_quote => escaped = true,
             '"' => in_quote = !in_quote,
             '#' if !in_quote => return &line[..i],
             _ => {}
@@ -270,7 +283,7 @@ fn parse_value(raw: &str) -> Result<Value, String> {
             return Err("字符串缺少收尾引号".into());
         }
         let inner = &raw[1..raw.len() - 1];
-        return Ok(Value::Str(unescape(inner)));
+        return Ok(Value::Str(unescape(inner)?));
     }
     if raw == "true" {
         return Ok(Value::Bool(true));
@@ -281,10 +294,10 @@ fn parse_value(raw: &str) -> Result<Value, String> {
     if let Ok(i) = raw.parse::<i64>() {
         return Ok(Value::Int(i));
     }
-    Err(format!("无法识别的值 `{raw}`（字符串请加双引号）"))
+    Err("无法识别的值（字符串请加双引号）".into())
 }
 
-fn unescape(s: &str) -> String {
+fn unescape(s: &str) -> Result<String, String> {
     let mut out = String::with_capacity(s.len());
     let mut chars = s.chars();
     while let Some(c) = chars.next() {
@@ -292,19 +305,19 @@ fn unescape(s: &str) -> String {
             match chars.next() {
                 Some('n') => out.push('\n'),
                 Some('t') => out.push('\t'),
+                Some('r') => out.push('\r'),
                 Some('"') => out.push('"'),
                 Some('\\') => out.push('\\'),
-                Some(other) => {
-                    out.push('\\');
-                    out.push(other);
-                }
-                None => out.push('\\'),
+                Some(_) => return Err("不支持的字符串转义".into()),
+                None => return Err("字符串末尾的反斜杠缺少转义字符".into()),
             }
+        } else if c == '"' {
+            return Err("字符串中含未转义的双引号".into());
         } else {
             out.push(c);
         }
     }
-    out
+    Ok(out)
 }
 
 fn parse_caps(raw: &str) -> Capabilities {
@@ -382,9 +395,51 @@ pub fn has_legacy_window_keys(text: &str) -> bool {
 }
 
 pub fn load(path: &std::path::Path) -> Result<AppConfig, String> {
-    let text = std::fs::read_to_string(path)
+    load_snapshot(path).map(|(config, _)| config)
+}
+
+/// 单次有界读取并返回原始文本快照，用于后续检测外部修改（含注释）。
+pub fn load_snapshot(path: &std::path::Path) -> Result<(AppConfig, String), String> {
+    use std::io::Read;
+    let mut bytes = Vec::new();
+    std::fs::File::open(path)
+        .and_then(|f| {
+            f.take((MAX_CONFIG_BYTES + 1) as u64)
+                .read_to_end(&mut bytes)
+        })
         .map_err(|e| format!("读取配置 {} 失败: {e}", path.display()))?;
-    parse(&text).map_err(|e| format!("{}: {e}", path.display()))
+    if bytes.len() > MAX_CONFIG_BYTES {
+        return Err(format!("{}: 配置超过 1 MiB 上限", path.display()));
+    }
+    let text = String::from_utf8(bytes)
+        .map_err(|_| format!("{}: 配置必须是合法 UTF-8", path.display()))?;
+    let config = parse(&text).map_err(|e| format!("{}: {e}", path.display()))?;
+    Ok((config, text))
+}
+
+/// 写入前检查原始文本仍等于读取快照；外部修改时保留文件并提示重新载入。
+/// 这是写前冲突检查，不能提供与不协作的外部写者之间的跨进程原子比较/替换。
+pub fn save_if_unchanged(
+    path: &std::path::Path,
+    cfg: &AppConfig,
+    expected: &str,
+) -> Result<String, String> {
+    let (_, current) = load_snapshot(path)?;
+    if current != expected {
+        return Err("配置已被外部修改，未覆盖文件；请重启载入最新配置后再修改设置".into());
+    }
+    save_atomic(path, cfg)?;
+    Ok(app_config_to_toml(cfg))
+}
+
+/// 验证配置可被本解析器读回后原子替换；失败时不覆盖旧配置。
+pub fn save_atomic(path: &std::path::Path, cfg: &AppConfig) -> Result<(), String> {
+    let text = app_config_to_toml(cfg);
+    let parsed = parse(&text)?;
+    if app_config_to_toml(&parsed) != text {
+        return Err("配置往返校验失败，未覆盖旧文件".into());
+    }
+    crate::file_io::write_atomic(path, text.as_bytes())
 }
 
 /// TOML 字符串转义（`parse_value` 的逆操作）。
@@ -395,6 +450,7 @@ fn escape_toml(s: &str) -> String {
             '\\' => out.push_str("\\\\"),
             '"' => out.push_str("\\\""),
             '\n' => out.push_str("\\n"),
+            '\r' => out.push_str("\\r"),
             '\t' => out.push_str("\\t"),
             other => out.push(other),
         }
@@ -524,6 +580,68 @@ caps = "snapshot,recording"
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn oversized_utf8_reports_size_limit_before_decoding() {
+        let path = std::env::temp_dir().join(format!(
+            "xdview-config-oversize-{}.toml",
+            std::process::id()
+        ));
+        std::fs::write(&path, format!("{}中", "a".repeat(MAX_CONFIG_BYTES))).unwrap();
+        let error = load_snapshot(&path).unwrap_err();
+        std::fs::remove_file(path).unwrap();
+        assert!(error.contains("超过"), "{error}");
+    }
+
+    #[test]
+    fn external_edit_is_not_overwritten_and_own_saves_advance_snapshot() {
+        let dir =
+            std::env::temp_dir().join(format!("xdview-config-conflict-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("config.toml");
+        std::fs::write(&path, EXAMPLE).unwrap();
+        let (mut config, source) = load_snapshot(&path).unwrap();
+        config.cameras[0].name = "first".into();
+        let source = save_if_unchanged(&path, &config, &source).unwrap();
+        config.cameras[0].name = "second".into();
+        let source = save_if_unchanged(&path, &config, &source).unwrap();
+        let edited = format!("{source}\n# external editor\n");
+        std::fs::write(&path, &edited).unwrap();
+        config.cameras[0].name = "third".into();
+        assert!(save_if_unchanged(&path, &config, &source)
+            .unwrap_err()
+            .contains("外部修改"));
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), edited);
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn atomic_save_validates_roundtrip_before_replacing_existing_configuration() {
+        let dir = std::env::temp_dir().join(format!("xdview-config-save-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("config.toml");
+        std::fs::write(&path, b"original").unwrap();
+        let mut config = parse(EXAMPLE).unwrap();
+        config.cameras[0].name = "too-large".repeat(MAX_CONFIG_BYTES);
+        assert!(save_atomic(&path, &config).is_err());
+        assert_eq!(std::fs::read(&path).unwrap(), b"original");
+        config.cameras[0].name = "Gate \"A#1\"".into();
+        save_atomic(&path, &config).unwrap();
+        assert_eq!(load(&path).unwrap().cameras[0].name, "Gate \"A#1\"");
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn escaped_quotes_and_hashes_survive_configuration_roundtrip() {
+        let mut cfg = AppConfig::default();
+        let mut camera = Camera::new("audit", "Gate \"A#1\"", "file.mp4");
+        camera.password = Some("demo\"#\\secret".into());
+        cfg.cameras.push(camera);
+        let serialized = app_config_to_toml(&cfg);
+        let parsed = parse(&serialized).expect("程序写出的配置必须能读取");
+        assert_eq!(parsed.cameras[0].name, cfg.cameras[0].name);
+        assert_eq!(parsed.cameras[0].password, cfg.cameras[0].password);
+    }
 
     #[test]
     fn parses_example() {

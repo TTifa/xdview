@@ -7,6 +7,60 @@ use std::process::Command;
 use std::time::{Duration, Instant};
 use xd_media::stream::{Event, Stream, StreamOptions};
 
+/// 奇数宽度必须真的缩放，不能以裁小后的步长读取未缩放 rawvideo。
+#[test]
+#[ignore = "需要本机安装 ffmpeg"]
+fn odd_image_preserves_row_boundaries() {
+    let dir = std::env::temp_dir().join(format!("xdview-odd-{}", std::process::id()));
+    std::fs::create_dir_all(&dir).unwrap();
+    let image = dir.join("odd.bmp");
+    let mut rgba = Vec::new();
+    for y in 0..241 {
+        for x in 0..321 {
+            rgba.extend_from_slice(&[(x % 256) as u8, y as u8, 0, 255]);
+        }
+    }
+    std::fs::write(
+        &image,
+        xd_media::Frame {
+            width: 321,
+            height: 241,
+            rgba,
+            seq: 0,
+            captured_ms: 0,
+        }
+        .to_bmp(),
+    )
+    .unwrap();
+    let mut opts = StreamOptions::new(image.to_string_lossy(), "ffmpeg");
+    opts.max_width = 0;
+    opts.reconnect = false;
+    opts.net.hwaccel = false;
+    let mut stream = Stream::start(opts);
+    let deadline = Instant::now() + Duration::from_secs(15);
+    let mut actual = None;
+    while Instant::now() < deadline {
+        match stream.recv_timeout(Duration::from_millis(100)) {
+            Some(Event::Frame(frame)) => {
+                actual = Some(frame);
+                break;
+            }
+            Some(Event::Failed(error)) => panic!("{error}"),
+            _ => {}
+        }
+    }
+    stream.stop();
+    let frame = actual.expect("应解码出一帧");
+    assert_eq!((frame.width, frame.height), (320, 240));
+    // 左下角的红色应接近零，绿色应接近 240；步长错位会落在完全不同的列。
+    let pixel = &frame.rgba[(239 * 320) * 4..][..4];
+    assert!(
+        pixel[0] <= 2 && pixel[1] >= 238 && pixel[2] == 0 && pixel[3] == 255,
+        "{pixel:?}"
+    );
+    std::fs::remove_dir_all(dir).unwrap();
+}
+
 /// 用本地单帧图像制造确定性的 EOF，验证中断、重开、首帧的实际事件顺序。
 #[test]
 #[ignore = "需要本机安装 ffmpeg"]

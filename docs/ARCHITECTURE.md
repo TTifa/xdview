@@ -51,6 +51,32 @@ ONVIF 的 `ConnectFailed.resolve_stream` 保留原请求的取流依赖；只有
 **录制/缓存**是独立的 ffmpeg 进程（`-c copy` 不重编码）：
 手动录像产出单个 MKV；滚动缓存走 `segment` 复用器切片并自动清理。
 
+app 的 background.rs 持有缓存和录像后台代理：创建、目录统计（每秒）、清理（每 15 秒）和
+停止均在工作线程执行。截图共享当前显示帧，BMP 编码与写盘在串行文件队列执行；
+配置对照原始文本快照检测外部修改，先验证往返再原子替换；串行队列保持多次保存的先后顺序。
+Windows 写回已有文件时，临时文件独占打开，在写入内容前复制原 DACL 及继承保护状态；
+复制失败拒绝保存，不降级为目录继承权限。保留范围不包括 owner/SACL，新文件沿用目录权限。
+旧 Stream 的停止和 join 也交给该队列。
+文件队列的待处理计数包含已完成但 UI 未消费的回执；录像代理同样保留到回执被读取，
+避免在“轮询回执”和“判定关窗”之间结束的失败任务被漏报。
+代理丢弃即取消，结果只回到原代理的接收端；取消期间启动成功的资源仍由工作线程收尾，不应用到新设备。
+切换设备取消旧导出，主动断开或跨设备切换请求旧录像收尾；录像代理保存所属设备 ID，
+不依赖 ONVIF 会话是否存在，同设备切换预览清晰度不停止独立录像。
+缓存所有权锁若中毒则报告错误并提示重启，不再循环等待。
+
+导出任务可取消，默认总运行上限 120 秒；先写同目录暂存文件，成功才替换输出，
+失败保留已有文件并删除暂存文件及 concat 清单。时间窗内没有片段时返回空，不回退到历史画面。
+导出选择片段与登记保留在同一锁内执行，清理（含 stop/Drop）在该锁下跳过已保留路径；
+使用规范目录路径及引用计数协调同进程的重叠导出，成功、失败、取消和超时均自动释放。
+ffmpeg 运行期间不持锁，其他片段正常清理；锁中毒则停止清理并拒绝新导出。该机制不协调外部进程删除。
+进程运行与 stderr 排空共用期限。Windows 导出在恢复前加入独立嵌套 Job，取消或超时先回收
+整个导出进程树再等待日志线程，不影响其他媒体进程；原进程级 Job 仍负责父进程异常退出。
+Unix 导出使用独立进程组（本轮未验证），其他平台拒绝启动该导出路径；文件系统阻塞不由运行期限中断。
+手动录像发 q 后最多等两秒，异常退出、空输出或超时均返回错误，不报告保存成功。
+正常关窗先取消导出、停止媒体、提交窗口几何并异步等待独立的 Stop 回执和保存任务；
+最多暂缓六秒，期间再次关闭或点“立即退出”可强制退出。on_exit 只发送取消，Windows Job 为异常退出兜底。
+保存或媒体收尾失败时单独记录失败状态，保留窗口显示原因；用户再次关闭即放行，不重新进入六秒等待。
+
 
 ### 1.1 目录地图
 
@@ -65,6 +91,7 @@ LICENSE                     MIT 许可证
 crates/xd-core/             零依赖 · 协议与模型
   src/model.rs              Camera/Capabilities/Transport、凭据注入、云台方向校正
   src/config.rs             TOML 子集解析/序列化（配置解析 + 设备导入导出）+ 内置 EXAMPLE
+  src/file_io.rs            同目录临时文件、同步与原子替换
   src/onvif.rs              SOAP 客户端：WS-UsernameToken + HTTP Digest、PTZ、GetStreamUri
   src/discovery.rs          WS-Discovery + 本机私网网段 ONVIF 探测
   src/http.rs               最小 HTTP/1.1（含 chunked）
@@ -78,16 +105,18 @@ crates/xd-media/            零依赖 · ffmpeg 管线
   src/stream.rs             拉流→解码→Frame 流（重连、日志降噪）
   src/cache.rs              滚动缓存（segment 切片/清理/导出）
   src/record.rs             手动录像（-c copy 到 MKV）
-  src/sys.rs                Windows 作业对象（子进程随父进程结束）
+  src/sys.rs                Windows 作业对象、导出独立进程树与回收
   src/frame.rs              RGBA 帧 + BMP 写出
   tests/pipeline.rs         真实 ffmpeg 解码端到端（ignore）
   tests/cache.rs            切片/导出/优雅收尾端到端（ignore，可用 XD_TEST_RTSP）
+  tests/process.rs          Windows Job 句柄稳定与异常父进程退出（ignore，专用 fixture）
   examples/probe_url.rs     单地址探针（排错首选）
   examples/export_cache.rs  命令行导出缓存片段
 
 crates/xd-app/              egui 界面
   src/main.rs               CLI 参数（--check/--discover/--onvif/--camera/--stats/--focus/--mini）
   src/app.rs                主界面 + 生命周期（on_exit 收尾）
+  src/background.rs         可取消媒体代理、缓存快照、串行文件和资源回收队列
   src/control.rs            ONVIF 后台线程（不阻塞 UI）
   src/font.rs               中文字体加载 + TTC→TTF 抽取
   src/storage.rs            系统用户数据目录、自定义路径与输出路径边界、窗口几何独立文件
@@ -138,7 +167,12 @@ tools/fetch_stream_url.ps1  历史诊断工具（仅本地，不入库）
 - 鉴权先 WS-UsernameToken，收到 401 + Digest 质询后以 MD5 / MD5-sess 重试；SHA-256 Digest 尚未实现。
 - RTSP 地址缺账号时由配置补充百分号编码的凭据；显示入口已有 mask_credentials，原始 stderr 等入口仍需单独核查。
 - invert_pan / invert_tilt 提供按机型的方向校正；真机判定方法见 [TESTING.md](TESTING.md#4-真机验证与排错)。
-- sys.rs 提供 Windows Job 归属能力；缓存已有 q 收尾路径。所有进程入口是否覆盖、录像是否正常收尾，应结合源码和回归测试确认。
+- sys.rs 复用进程级 Job，创建、设置、挂入及归属查询失败均返回错误；启动入口终止并 wait，不继续无保护运行。
+  设置 Job 失败会关闭新句柄，正常运行不为每次重连保留一个 Job。Windows 以 CREATE_SUSPENDED 创建，
+  挂入并检查 Job 后才恢复主线程，防止检查之前开始写盘；恢复失败同样 kill + wait。
+  父进程若恰在创建与挂入之间崩溃，仍可能留下未执行的挂起进程，但不会运行媒体写盘。
+  专用进程测试覆盖挂入后的父进程强杀，失败注入测试确认挂入前没有文件写出。
+  录像及缓存均通过 stdin q 收尾，超时回收；正常退出等待放在后台。
 
 ### 4.2 解析与敏感数据
 
@@ -162,8 +196,13 @@ tools/fetch_stream_url.ps1  历史诊断工具（仅本地，不入库）
 - 优先集中封装启动与所有权。Windows 生产进程设置 `CREATE_NO_WINDOW`，启动后检查 `kill_with_parent/Job` 归属结果；归属失败须终止并回收子进程、报告错误，不能只调用后假定成功。
 - ffmpeg、ffprobe、导出进程全部覆盖；`output()/status()` 也会启动进程。超时必须终止并 wait，不能只停止等待结果、留下线程或进程。
 - 保存进程和 Job 的资源所有者；使用共享 Job 或 RAII 关闭句柄，避免每次重连泄漏句柄。归属存在启动窗口时说明限制并验证异常退出行为。
+- Windows 只缓存成功初始化的 Job，暂时失败后后续启动可重试；按创建、设置、挂入、检查或恢复线程阶段给出中文诊断与系统错误。
+  Windows 8 及以后支持符合层级规则、没有冲突 UI 限制的嵌套 Job，不能一概禁止 IDE/CI 启动。
+  不兼容的外层 Job 或权限/资源问题仍终止本次启动，不降级为无保护运行；可从资源管理器直接启动排查，
+  再检查启动器限制和系统资源。专用测试验证普通外层 Job，不代表覆盖所有企业管控策略。
 - 写媒体文件的正常停止：允许 stdin 接收 q，有限等待写完尾部，再兜底 kill + wait。MKV 不能替代正常收尾。
-- `App::on_exit` 显式收尾，Drop 作幂等兜底；不要假定崩溃会运行析构。非 Windows 的空实现不能宣称已提供同等保证；新增支持平台时补相应实现和验证。
+- 正常关闭由 guard_close 请求后台显式收尾并异步等待，`App::on_exit` 发送取消，Drop 作幂等兜底；
+  不要假定崩溃会运行析构。非 Windows 的空实现不能宣称已提供同等保证；新增支持平台时补相应实现和验证。
 - 测试/辅助工具可以不复用生产封装，但仍需限制运行时间、隐藏非交互窗口并清理其启动的进程。
 
 ---
@@ -191,6 +230,15 @@ tools/fetch_stream_url.ps1  历史诊断工具（仅本地，不入库）
 **实现层面**
 
 - ONVIF 仅支持 `http://`（不带 TLS）；HTTPS 的相机需在设备侧关闭 TLS 或另接 TLS 栈。
+- HTTP 的 DNS、连接、发送和完整响应共用一个截止时间；主机名解析使用单个有界队列的解析线程，
+  系统 DNS 本身不可中断，卡住时调用者仍按期限返回，后续解析可能报告忙，不无限创建线程。
+  响应头和 chunk 元数据分别最多 64 KiB，消息体最多 8 MiB；
+  支持单个 Content-Length、chunked 或关闭连接定界，拒绝截断、重复/冲突长度、非完整终止块和超时。
+  无长度声明的响应必须在总期限内读到 EOF；即使已收到看似完整的 XML，服务端不关闭连接仍明确报错。
+  不以“已收到字节后超时”推断完整性，此类不规范设备的兼容策略需真实设备证据与独立方案。
+  暂不支持 1xx 临时响应、HTTPS 和连接复用，错误不把不完整消息视作成功。
+  XML 提取器不再将未闭合的目标元素尾部作为有效值返回；它仍是提取子集，不是完整 XML 文档校验器。
+  CLI 使用统一的诊断输出宏，在格式化设备回包及错误后脱敏 URL；ffmpeg stderr 和 UI 日志保留各自的输出边界。
 - ONVIF 鉴权不支持 **SHA-256 Digest**（部分 VIGI 把摘要算法设成 SHA-256），会明确报错并提示去 Web UI 改回 MD5。
 - 未实现双向语音对讲（需要 ONVIF Profile T 的 back-channel / 反向 RTP）。
 - 多路同时预览未做（当前一次连一路；`xd-media::Stream` 本身可多实例）。

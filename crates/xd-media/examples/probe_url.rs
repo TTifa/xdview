@@ -8,6 +8,7 @@
 //! 第二个参数是要抓的帧数（默认 10）。排查相机地址/密码/编码问题时先用它。
 
 use std::time::{Duration, Instant};
+use xd_core::{diagnostic_eprintln as eprintln, diagnostic_println as println};
 use xd_media::stream::{Event, Stream, StreamOptions};
 
 fn main() {

@@ -1,11 +1,13 @@
 //! 录像：另起一个 ffmpeg 做 `-c copy`，不重新解码，CPU 占用极低。
 //!
-//! 容器固定用 MKV：进程随时被杀（点停止、崩溃、断电）都不会得到坏文件，
-//! MP4 则需要写完 moov 才能播。
+//! 容器固定用 MKV，正常停止必须让 ffmpeg 写完索引与时长。
+//! 强杀、崩溃或断电仍可能留下不完整文件，不能报告正常保存成功。
 
 use crate::ffmpeg::{apply_net, record_args, NetOptions};
+use std::io::Write;
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Stdio};
+use std::time::{Duration, Instant};
 
 pub struct Recorder {
     child: Child,
@@ -30,7 +32,7 @@ impl Recorder {
         let args = record_args(url, &out_path.to_string_lossy(), low_latency, net);
         let mut cmd = Command::new(ffmpeg);
         cmd.args(&args)
-            .stdin(Stdio::null())
+            .stdin(Stdio::piped())
             .stdout(Stdio::null())
             .stderr(Stdio::null());
         apply_net(&mut cmd, net);
@@ -57,11 +59,36 @@ impl Recorder {
         self.child.try_wait().ok().flatten()
     }
 
-    /// 停止并收尾，返回输出文件路径。
-    pub fn stop(mut self) -> PathBuf {
-        let _ = self.child.kill();
-        let _ = self.child.wait();
-        self.path.clone()
+    /// 请求 ffmpeg 写完容器后退出，最多等两秒；超时强制回收并报告失败。
+    /// 仅成功退出且输出非空时返回路径。必须在后台线程调用。
+    pub fn stop(mut self) -> Result<PathBuf, String> {
+        if let Some(mut input) = self.child.stdin.take() {
+            let _ = input.write_all(b"q\n");
+        }
+        let deadline = Instant::now() + Duration::from_secs(2);
+        loop {
+            match self.child.try_wait() {
+                Ok(Some(status)) => {
+                    if !status.success() {
+                        return Err(format!("录像进程异常退出：{status}；请检查输出文件"));
+                    }
+                    if std::fs::metadata(&self.path)
+                        .map(|m| m.len() > 0)
+                        .unwrap_or(false)
+                    {
+                        return Ok(self.path.clone());
+                    }
+                    return Err("录像未生成有效文件，请检查流地址和目录权限".into());
+                }
+                Err(e) => return Err(format!("等待录像退出失败：{e}")),
+                Ok(None) if Instant::now() >= deadline => {
+                    let _ = self.child.kill();
+                    let _ = self.child.wait();
+                    return Err("录像收尾超时，已终止进程；输出可能不完整，请检查文件".into());
+                }
+                Ok(None) => std::thread::sleep(Duration::from_millis(20)),
+            }
+        }
     }
 }
 

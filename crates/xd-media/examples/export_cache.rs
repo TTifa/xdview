@@ -5,8 +5,13 @@
 //! ```
 
 use std::path::PathBuf;
+use xd_core::diagnostic_println as println;
 
 fn main() -> Result<(), String> {
+    run().map_err(|e| xd_core::onvif::mask_url_in_text(&e))
+}
+
+fn run() -> Result<(), String> {
     let args: Vec<String> = std::env::args().skip(1).collect();
     if args.len() < 3 {
         return Err("用法: export_cache <缓存目录> <最近几分钟> <输出文件>".to_string());
@@ -24,7 +29,7 @@ fn main() -> Result<(), String> {
     let n = xd_media::cache::export(
         "ffmpeg",
         &dir,
-        minutes * 60,
+        minutes.saturating_mul(60),
         &out,
         xd_media::NetOptions::default(),
     )?;

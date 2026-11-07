@@ -9,6 +9,7 @@
 //! ```
 
 mod app;
+mod background;
 mod control;
 mod font;
 mod prefs;
@@ -16,6 +17,7 @@ mod storage;
 mod theme;
 
 use std::path::{Path, PathBuf};
+use xd_core::{diagnostic_eprintln as eprintln, diagnostic_println as println};
 
 fn main() -> eframe::Result {
     let mut cfg_path = PathBuf::from("config.toml");
@@ -62,7 +64,7 @@ fn main() -> eframe::Result {
                     _ => None,
                 };
                 let client = xd_core::onvif::OnvifClient::new(base.clone(), creds);
-                println!("端点: {base}");
+                println!("端点: {}", xd_core::onvif::mask_url_in_text(&base));
                 match client.device_info() {
                     Ok(info) => println!("设备: {info}"),
                     Err(e) => println!("取设备信息失败: {e}"),
@@ -73,7 +75,9 @@ fn main() -> eframe::Result {
                         for p in &profiles {
                             println!("  profile {} ({})", p.token, p.name);
                             match client.get_stream_uri(&p.token) {
-                                Ok(uri) => println!("    RTSP: {uri}"),
+                                Ok(uri) => {
+                                    println!("    RTSP: {}", xd_core::onvif::mask_url_in_text(&uri))
+                                }
                                 Err(e) => println!("    取流地址失败: {e}"),
                             }
                             match client.get_presets(&p.token) {
@@ -178,7 +182,7 @@ fn main() -> eframe::Result {
         }
     }
     let cfg = load_or_create(&cfg_path);
-    let cfg = match cfg {
+    let (cfg, config_source) = match cfg {
         Ok(c) => c,
         Err(e) => {
             eprintln!("配置错误：{e}");
@@ -232,7 +236,9 @@ fn main() -> eframe::Result {
                 c.name,
                 c.id,
                 c.transport().as_str(),
-                c.onvif_base().unwrap_or_else(|| "无".to_string()),
+                xd_core::onvif::mask_url_in_text(
+                    &c.onvif_base().unwrap_or_else(|| "无".to_string())
+                ),
                 c.capabilities.to_spec(),
                 extra
             );
@@ -284,7 +290,8 @@ fn main() -> eframe::Result {
         "xdview",
         options,
         Box::new(move |cc| {
-            let mut view = app::XdView::new(cc, cfg, cfg_path, storage, geom, theme);
+            let mut view =
+                app::XdView::new(cc, cfg, config_source, cfg_path, storage, geom, theme)?;
             if start_focus {
                 view.start_focus_mode(&cc.egui_ctx, start_mini);
             }
@@ -325,11 +332,29 @@ fn resolve_config_path(want: &Path) -> PathBuf {
 }
 
 /// 读配置；不存在就落一份示例到磁盘并直接用它。
-fn load_or_create(path: &Path) -> Result<xd_core::config::AppConfig, String> {
+fn load_or_create(path: &Path) -> Result<(xd_core::config::AppConfig, String), String> {
     if path.exists() {
-        return xd_core::config::load(path);
+        return xd_core::config::load_snapshot(path);
     }
-    let _ = std::fs::write(path, xd_core::config::EXAMPLE);
-    xd_core::config::parse(xd_core::config::EXAMPLE)
-        .map_err(|e| format!("内置示例配置解析失败：{e}"))
+    let config = xd_core::config::parse(xd_core::config::EXAMPLE)
+        .map_err(|e| format!("内置示例配置解析失败：{e}"))?;
+    xd_core::file_io::write_atomic(path, xd_core::config::EXAMPLE.as_bytes())?;
+    let source = xd_core::config::EXAMPLE.to_string();
+    Ok((config, source))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    #[test]
+    fn first_configuration_keeps_example_comments_and_matching_snapshot() {
+        let path =
+            std::env::temp_dir().join(format!("xdview-first-config-{}.toml", std::process::id()));
+        let _ = std::fs::remove_file(&path);
+        let (_, source) = load_or_create(&path).unwrap();
+        let written = std::fs::read_to_string(&path).unwrap();
+        std::fs::remove_file(path).unwrap();
+        assert_eq!(written, xd_core::config::EXAMPLE);
+        assert_eq!(source, written);
+    }
 }
