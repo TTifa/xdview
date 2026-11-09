@@ -51,6 +51,8 @@ cargo test -p xd-media --test process -- --ignored --exact job_lifecycle
 
 上表是按风险选取的验收范围，不表示已有测试全部覆盖。具体设计契约见 [ARCHITECTURE.md](ARCHITECTURE.md) §4。
 
+设备列表改动还需使用合成地址检查空列表、发现及两种手填页签、取消和重复校验、添加只保存与保存并播放、编辑名称及连接信息、删除当前和其他设备、保存失败重试；深浅主题下检查窄栏、小窗口、长名称及地址，确认菜单点击不触发行播放。空设备配置应能保存并重新载入，空设备导入仍应被拒绝。
+
 本地 cache 追加用例覆盖手动录像 q 收尾后的真实可解码性/时长、拒绝收尾的进程超时回收、
 导出取消/超时及保留已有目标。拒绝收尾使用临时 cmd fixture，不连接设备。
 `export_deadline_covers_inherited_stderr` 使用包装脚本启动继承 stderr 的专用后代，

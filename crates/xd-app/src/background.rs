@@ -87,12 +87,14 @@ impl Background {
             .map_err(|e| format!("无法启动文件与资源回收线程：{e}；请释放系统资源后重试"))?;
         Ok(Self { tx, rx, pending })
     }
-    pub fn submit(&self, work: impl FnOnce() -> Result<String, String> + Send + 'static) {
+    pub fn submit(&self, work: impl FnOnce() -> Result<String, String> + Send + 'static) -> bool {
         self.pending.fetch_add(1, Ordering::AcqRel);
         // worker 捕获每项任务的 panic，界面存活时接收端不会主动关闭。
         if self.tx.send(Box::new(work)).is_err() {
             self.pending.fetch_sub(1, Ordering::Release);
+            return false;
         }
+        true
     }
     pub fn pending(&self) -> bool {
         self.pending.load(Ordering::Acquire) != 0

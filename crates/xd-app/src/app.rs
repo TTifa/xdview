@@ -41,9 +41,176 @@ const OVERLAY_BUTTONS_W: f32 = 176.0;
 /// 正常关窗异步等待保存、媒体收尾和云台 Stop 的上限；再次关闭可立即退出。
 const CLOSE_DEFER_MAX: Duration = Duration::from_secs(6);
 
-/// 扫描弹窗正文的固定高度：扫描中 / 无结果 / 结果列表三种状态共用，
-/// 弹窗高度就不会随设备条数或状态变化而跳动。
-const SCAN_BODY_H: f32 = 250.0;
+/// 未选择设备时的索引；不会指向任何配置项。
+const NO_DEVICE: usize = usize::MAX;
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum DeviceTab {
+    Discover,
+    Onvif,
+    Stream,
+}
+
+#[derive(Default)]
+struct DeviceForm {
+    editing: Option<String>,
+    name: String,
+    onvif: String,
+    stream: String,
+    sub_stream: String,
+    user: String,
+    pass: String,
+}
+
+/// 仅显示 URL 的主机和端口，不展示账号、路径或查询。
+fn address_host(raw: &str) -> Option<&str> {
+    let (_, rest) = raw.trim().split_once("://")?;
+    let authority = rest.split(['/', '?', '#']).next()?;
+    let host = authority.rsplit('@').next()?.trim();
+    (!host.is_empty() && !host.contains(char::is_whitespace)).then_some(host)
+}
+
+fn normalized_onvif(raw: &str) -> Result<String, String> {
+    let value = raw.trim();
+    let value = if value.contains("://") {
+        value.to_owned()
+    } else {
+        format!("http://{value}")
+    };
+    if !value.to_ascii_lowercase().starts_with("http://")
+        || address_host(&value).is_none()
+        || value.contains('@')
+        || value.contains('?')
+        || value.contains('#')
+        || value.chars().any(char::is_whitespace)
+    {
+        return Err("请填写有效的 HTTP ONVIF 地址，账号请填写在独立字段".into());
+    }
+    let mut camera = Camera::new("", "", "");
+    camera.onvif_url = Some(value);
+    let base = camera
+        .onvif_base()
+        .ok_or_else(|| "ONVIF 地址无效".to_string())?;
+    let (_, rest) = base
+        .split_once("://")
+        .ok_or_else(|| "ONVIF 地址无效".to_string())?;
+    let end = rest.find('/').unwrap_or(rest.len());
+    let authority = &rest[..end];
+    let (host, port) = match authority.split_once(':') {
+        Some((host, port)) => {
+            let port = port
+                .parse::<u16>()
+                .map_err(|_| "ONVIF 端口无效".to_string())?;
+            if port == 0 {
+                return Err("ONVIF 端口无效".into());
+            }
+            (
+                host,
+                if port == 80 {
+                    String::new()
+                } else {
+                    format!(":{port}")
+                },
+            )
+        }
+        None => (authority, String::new()),
+    };
+    if host.is_empty() || host.contains(['[', ']']) {
+        return Err("ONVIF 主机无效".into());
+    }
+    Ok(format!(
+        "http://{}{}{}",
+        host.to_ascii_lowercase(),
+        port,
+        &rest[end..]
+    ))
+}
+
+fn valid_stream(raw: &str) -> bool {
+    let Some((scheme, _)) = raw.split_once("://") else {
+        return false;
+    };
+    let mut chars = scheme.chars();
+    chars.next().is_some_and(|c| c.is_ascii_alphabetic())
+        && chars.all(|c| c.is_ascii_alphanumeric() || matches!(c, '+' | '-' | '.'))
+        && address_host(raw).is_some()
+}
+
+fn connection_changed(cam: &Camera, form: &DeviceForm) -> bool {
+    let old_onvif = cam
+        .onvif_url
+        .as_deref()
+        .and_then(|s| normalized_onvif(s).ok());
+    let new_onvif = if form.onvif.trim().is_empty() {
+        None
+    } else {
+        normalized_onvif(&form.onvif).ok()
+    };
+    old_onvif != new_onvif
+        || cam.stream_url != form.stream.trim()
+        || cam.sub_stream_url.as_deref().unwrap_or("") != form.sub_stream.trim()
+        || cam.username.as_deref().unwrap_or("") != form.user.trim()
+        || cam.password.as_deref().unwrap_or("") != form.pass
+}
+
+fn remember_stream_uri(cam: &mut Camera, uri: &str) {
+    // 临时注入的账号不能固化进地址，否则编辑账号后仍会使用旧凭据。
+    cam.stream_url = uri.to_string();
+    if cam.capabilities.ptz || cam.onvif_url.is_some() {
+        cam.capabilities.ptz = true;
+        cam.capabilities.zoom = true;
+    }
+}
+
+fn new_camera_id(cameras: &[Camera]) -> String {
+    static NEXT_ID: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+    loop {
+        let time = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_nanos();
+        let counter = NEXT_ID.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        let id = format!("camera-{time:x}-{counter:x}");
+        if !cameras.iter().any(|c| c.id == id) {
+            return id;
+        }
+    }
+}
+
+fn should_play(selected: usize, index: usize, conn: &Conn) -> bool {
+    selected != index || !matches!(conn, Conn::Live { .. } | Conn::Connecting)
+}
+
+fn selection_after_delete(selected: usize, removed: usize) -> usize {
+    if selected == removed {
+        NO_DEVICE
+    } else if selected != NO_DEVICE && removed < selected {
+        selected - 1
+    } else {
+        selected
+    }
+}
+
+fn apply_config_receipt(
+    current: u64,
+    revision: u64,
+    result: Result<(), String>,
+    error: &mut Option<String>,
+) -> bool {
+    if current != revision {
+        return false;
+    }
+    match result {
+        Ok(()) => {
+            *error = None;
+            false
+        }
+        Err(reason) => {
+            *error = Some(xd_core::onvif::mask_url_in_text(&reason));
+            true
+        }
+    }
+}
 
 /// 界面形态：普通三栏 / 专注（只看视频）/ 小窗（专注 + 无边框置顶）。
 /// 全屏由视口单独管理。
@@ -127,6 +294,86 @@ fn remember_geom(geom: &mut WindowGeom, slot: GeomSlot, viewport: &egui::Viewpor
         GeomSlot::Win => geom.win = Some(rect),
         GeomSlot::Mini => geom.mini = Some(rect),
     }
+}
+
+fn prepare_device(
+    form: &DeviceForm,
+    tab: DeviceTab,
+    cameras: &[Camera],
+) -> Result<(Camera, Option<usize>, bool), String> {
+    let use_onvif = form.editing.is_some() || tab == DeviceTab::Onvif;
+    let use_stream = form.editing.is_some() || tab == DeviceTab::Stream;
+    let onvif = if !use_onvif || form.onvif.trim().is_empty() {
+        None
+    } else {
+        Some(normalized_onvif(&form.onvif)?)
+    };
+    let stream = if use_stream { form.stream.trim() } else { "" };
+    let sub = if use_stream {
+        form.sub_stream.trim()
+    } else {
+        ""
+    };
+    if onvif.is_none() && stream.is_empty() {
+        return Err("请填写 ONVIF 地址或主流地址".into());
+    }
+    if !stream.is_empty() && !valid_stream(stream) {
+        return Err("主流地址无效，请填写完整的网络流地址".into());
+    }
+    if !sub.is_empty() && !valid_stream(sub) {
+        return Err("子流地址无效，请填写完整的网络流地址".into());
+    }
+    let existing = form
+        .editing
+        .as_ref()
+        .and_then(|id| cameras.iter().position(|c| &c.id == id));
+    if form.editing.is_some() && existing.is_none() {
+        return Err("设备已不存在，请关闭窗口后重试".into());
+    }
+    let duplicate = cameras.iter().enumerate().any(|(i, c)| {
+        if Some(i) == existing {
+            return false;
+        }
+        if let Some(base) = &onvif {
+            c.onvif_url
+                .as_deref()
+                .and_then(|v| normalized_onvif(v).ok())
+                .as_ref()
+                == Some(base)
+        } else {
+            c.onvif_url.as_deref().unwrap_or("").trim().is_empty() && c.stream_url.trim() == stream
+        }
+    });
+    if duplicate {
+        return Err("该设备已在列表中，请编辑已有设备".into());
+    }
+    let host = onvif
+        .as_deref()
+        .and_then(address_host)
+        .or_else(|| address_host(stream))
+        .unwrap_or("设备");
+    let name = if form.name.trim().is_empty() {
+        host.to_string()
+    } else {
+        form.name.trim().to_string()
+    };
+    let mut cam = if let Some(i) = existing {
+        cameras[i].clone()
+    } else {
+        let mut cam = Camera::new(new_camera_id(cameras), "", "");
+        if onvif.is_none() {
+            cam.capabilities = xd_core::model::Capabilities::viewer_only();
+        }
+        cam
+    };
+    let changed = connection_changed(&cam, form);
+    cam.name = name;
+    cam.onvif_url = onvif;
+    cam.stream_url = stream.to_string();
+    cam.sub_stream_url = (!sub.is_empty()).then(|| sub.to_string());
+    cam.username = (!form.user.trim().is_empty()).then(|| form.user.trim().to_string());
+    cam.password = (!form.pass.is_empty()).then(|| form.pass.clone());
+    Ok((cam, existing, changed))
 }
 
 /// 视口命令异步生效，全屏状态以视口为准。
@@ -340,8 +587,6 @@ pub struct XdView {
     storage: StoragePaths,
     discovered: Vec<DiscoveredDevice>,
     scanning: bool,
-    /// 扫描弹窗是否打开（结果与进度都在弹窗里，侧栏不再内联）
-    scan_open: bool,
     /// 上一次扫描的失败原因（WS-Discovery 异常等），成功或重新扫描时清空
     scan_error: Option<String>,
     /// 首帧时自动连接第一路（单机看护场景几乎总是希望一打开就出画面）
@@ -355,6 +600,10 @@ pub struct XdView {
     cache_retry_at: Option<Instant>,
     background: Background,
     config_source: std::sync::Arc<std::sync::Mutex<String>>,
+    config_tx: std::sync::mpsc::Sender<(u64, Result<(), String>)>,
+    config_rx: std::sync::mpsc::Receiver<(u64, Result<(), String>)>,
+    config_revision: u64,
+    config_error: Option<String>,
     export_task: Option<Task<Result<String, String>>>,
     shutdown_at: Option<Instant>,
     shutdown_stop: Option<std::sync::Arc<std::sync::atomic::AtomicBool>>,
@@ -396,11 +645,13 @@ pub struct XdView {
     initial_position_pending: bool,
     /// 「添加设备」弹窗（手填 ONVIF 地址；小度/TP-Link 不支持 WS-Discovery，这是正路）
     add_open: bool,
-    add_name: String,
-    add_url: String,
-    add_user: String,
-    add_pass: String,
     add_error: String,
+    device_tab: DeviceTab,
+    device_form: DeviceForm,
+    /// 编辑设备时临时显示密码，重新打开时恢复遮盖。
+    device_password_visible: bool,
+    delete_device: Option<String>,
+    reconnecting: bool,
     /// 当前主题（夜间 / 日间），与 `pal` 同步切换
     theme: Theme,
     /// 当前色板快照；所有绘制读这里，不在各处硬编码颜色
@@ -466,10 +717,12 @@ impl XdView {
         // 写线程在窗口之前起好：首次切换主题时直接投递，不必临时建线程
         let prefs = PrefsWriter::spawn(storage.root().to_path_buf());
 
+        let selected = if cfg.cameras.is_empty() { NO_DEVICE } else { 0 };
+        let (config_tx, config_rx) = std::sync::mpsc::channel();
         let mut view = XdView {
             cfg,
             cfg_path,
-            selected: 0,
+            selected,
             stream: None,
             preview: Preview::default(),
             stats: Stats::default(),
@@ -488,7 +741,6 @@ impl XdView {
             storage,
             discovered: Vec::new(),
             scanning: false,
-            scan_open: false,
             scan_error: None,
             autostart: true,
             stats_stdout: false,
@@ -497,6 +749,10 @@ impl XdView {
             cache_retry_at: None,
             background,
             config_source: std::sync::Arc::new(std::sync::Mutex::new(config_source)),
+            config_tx,
+            config_rx,
+            config_revision: 0,
+            config_error: None,
             export_task: None,
             shutdown_at: None,
             shutdown_stop: None,
@@ -518,11 +774,12 @@ impl XdView {
             pending_restore: None,
             initial_position_pending: true,
             add_open: false,
-            add_name: String::new(),
-            add_url: String::new(),
-            add_user: String::new(),
-            add_pass: String::new(),
             add_error: String::new(),
+            device_tab: DeviceTab::Discover,
+            device_form: DeviceForm::default(),
+            device_password_visible: false,
+            delete_device: None,
+            reconnecting: false,
             theme,
             pal,
             prefs,
@@ -672,6 +929,7 @@ impl XdView {
         self.stats.reset();
         self.velocity = Velocity::default();
         self.conn = Conn::Connecting;
+        self.reconnecting = false;
 
         // 配置里可能把账号写在独立字段（TP-Link/海康常见），这里补进 URL
         let url = cam.resolved_url(self.high_stream);
@@ -794,6 +1052,19 @@ impl XdView {
         let mut failed = false;
         while let Some(result) = self.background.try_recv() {
             failed |= self.report_background(result);
+        }
+        while let Ok((revision, result)) = self.config_rx.try_recv() {
+            if apply_config_receipt(
+                self.config_revision,
+                revision,
+                result,
+                &mut self.config_error,
+            ) {
+                failed = true;
+                if let Some(error) = self.config_error.clone() {
+                    self.push_lv(Level::Err, format!("配置更改未保存：{error}"));
+                }
+            }
         }
         if let Some(result) = self.recorder.as_ref().and_then(|rec| rec.poll()) {
             self.recorder = None;
@@ -944,142 +1215,117 @@ impl XdView {
 
     /// 把当前配置写回 config.toml（新增/导入设备、改设置后调用，重启不丢）。
     fn persist_config(&mut self) {
+        self.config_revision = self.config_revision.saturating_add(1);
+        let revision = self.config_revision;
         let config = self.cfg.clone();
         let path = self.cfg_path.clone();
         let source = std::sync::Arc::clone(&self.config_source);
-        self.background.submit(move || {
-            let mut source = source
-                .lock()
-                .map_err(|_| "配置保存状态异常，请重启后重试".to_string())?;
-            *source = xd_core::config::save_if_unchanged(&path, &config, &source)?;
-            Ok(format!("配置已保存 → {}", path.display()))
+        let tx = self.config_tx.clone();
+        let queued = self.background.submit(move || {
+            let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                let mut source = source
+                    .lock()
+                    .map_err(|_| "配置保存状态异常，请重启后重试".to_string())?;
+                *source = xd_core::config::save_if_unchanged(&path, &config, &source)?;
+                Ok(())
+            }))
+            .unwrap_or_else(|_| Err("配置保存任务异常退出，请重试".into()));
+            let _ = tx.send((revision, result));
+            Ok(String::new())
         });
+        if !queued {
+            self.config_error = Some("无法提交配置保存任务，请重启后重试".into());
+        }
     }
 
-    /// 手填 ONVIF 地址添加设备并立即连接。
-    ///
-    /// 小度/TP-Link 等设备不响应 WS-Discovery，扫描永远是空的——手填是正路。
-    /// 地址可以只写 `http://ip:port`，服务路径由客户端按约定补（/onvif/device_service）。
-    fn add_device_manual(&mut self) {
-        let raw = self.add_url.trim().trim_end_matches('/').to_string();
-        if raw.is_empty() {
-            self.add_error = "请填写 ONVIF 地址，例如 http://192.168.1.64:8080".into();
-            return;
-        }
-        let with_scheme = if raw.contains("://") {
-            raw
-        } else {
-            format!("http://{raw}")
-        };
-        let Some((scheme, rest)) = with_scheme.split_once("://") else {
-            self.add_error = "地址格式不对".into();
-            return;
-        };
-        let host = rest.split('/').next().unwrap_or("");
-        if host.is_empty() {
-            self.add_error = "地址里没有主机名".into();
-            return;
-        }
-        let base = format!("{scheme}://{host}");
-        if self
-            .cfg
-            .cameras
-            .iter()
-            .any(|c| c.onvif_base().as_deref() == Some(base.as_str()))
-        {
-            self.add_error = "该设备已在列表里".into();
-            return;
-        }
-        let name = if self.add_name.trim().is_empty() {
-            host.to_string()
-        } else {
-            self.add_name.trim().to_string()
-        };
-        let id = format!("onvif-{}", host.replace(':', "-"));
-        let mut cam = Camera::new(id, name, String::new());
-        cam.onvif_url = Some(base.clone());
-        if !self.add_user.trim().is_empty() {
-            cam.username = Some(self.add_user.trim().to_string());
-            cam.password = Some(self.add_pass.clone());
-        }
-        self.cfg.cameras.push(cam);
-        self.selected = self.cfg.cameras.len() - 1;
-        self.reset_zoom();
-        self.high_stream = true;
-        self.add_open = false;
-        self.add_name.clear();
-        self.add_url.clear();
-        self.add_user.clear();
-        self.add_pass.clear();
+    fn open_add(&mut self) {
+        self.device_form = DeviceForm::default();
+        self.device_password_visible = false;
+        self.device_tab = DeviceTab::Discover;
         self.add_error.clear();
-        self.push_lv(Level::Ok, format!("加入设备（{base}）"));
-        self.persist_config();
+        self.add_open = true;
+    }
+
+    fn open_edit(&mut self, index: usize) {
+        let Some(cam) = self.cfg.cameras.get(index) else {
+            return;
+        };
+        self.device_password_visible = false;
+        self.device_form = DeviceForm {
+            editing: Some(cam.id.clone()),
+            name: cam.name.clone(),
+            onvif: cam.onvif_url.clone().unwrap_or_default(),
+            stream: cam.stream_url.clone(),
+            sub_stream: cam.sub_stream_url.clone().unwrap_or_default(),
+            user: cam.username.clone().unwrap_or_default(),
+            pass: cam.password.clone().unwrap_or_default(),
+        };
+        self.device_tab = if cam.onvif_url.is_some() {
+            DeviceTab::Onvif
+        } else {
+            DeviceTab::Stream
+        };
+        self.add_error.clear();
+        self.add_open = true;
+    }
+
+    fn play_device(&mut self, index: usize) {
+        if index >= self.cfg.cameras.len() {
+            return;
+        }
+        if !should_play(self.selected, index, &self.conn) {
+            return;
+        }
+        self.selected = index;
+        self.reset_zoom();
         self.connect_selected();
     }
 
-    /// 把一个扫描到的 ONVIF 设备加进列表并立即接入。
-    /// 打开扫描弹窗；「没有结果 + 没在扫」时才真正发起一次探测。
-    ///
-    /// 结果保留到下一次探测：关掉弹窗再打开能看到上次扫到的设备，继续接入。
-    fn open_scan(&mut self) {
-        self.scan_open = true;
-        if self.discovered.is_empty() && !self.scanning {
-            self.start_scan();
+    fn save_device_form(&mut self, play: bool) -> Result<(), String> {
+        let (cam, existing, changed) =
+            prepare_device(&self.device_form, self.device_tab, &self.cfg.cameras)?;
+        let index = existing.unwrap_or(self.cfg.cameras.len());
+        if existing.is_some() {
+            self.cfg.cameras[index] = cam;
+        } else {
+            self.cfg.cameras.push(cam);
         }
+        self.persist_config();
+        if existing.is_some()
+            && index == self.selected
+            && changed
+            && matches!(self.conn, Conn::Connecting | Conn::Live { .. })
+        {
+            self.stop_recording_unless(None);
+            self.connect_selected();
+        } else if play && existing.is_none() {
+            self.play_device(index);
+        }
+        Ok(())
     }
 
-    /// 发起一次探测（WS-Discovery + 网段探测），结果经 `Feedback::Devices` 回来。
     fn start_scan(&mut self) {
         if self.scanning {
             return;
         }
         self.scanning = true;
-        // 清掉上一轮，免得「扫描中」时还挂着旧结果或旧错误
         self.discovered.clear();
         self.scan_error = None;
         self.push_log("发送 WS-Discovery 探测…");
         self.control.send(Command::Discover { timeout_ms: 2000 });
     }
 
-    /// 当前设备的连接状态短语（扫描弹窗卡片用；只对选中的那台准确）。
-    fn short_status(&self) -> (&'static str, egui::Color32) {
-        match &self.conn {
-            Conn::Live { .. } => ("已连接", self.pal.ok),
-            Conn::Connecting => ("连接中…", self.pal.warn),
-            Conn::Failed(_) => ("连接失败", self.pal.bad),
-            Conn::Idle => ("已加入", self.pal.dim),
-        }
-    }
-
-    fn adopt(&mut self, dev: &DiscoveredDevice) {
-        let Some(base) = dev.base_url() else {
-            self.toast("设备地址无法解析");
+    fn delete_camera(&mut self, id: &str) {
+        let Some(index) = self.cfg.cameras.iter().position(|c| c.id == id) else {
             return;
         };
-        if self
-            .cfg
-            .cameras
-            .iter()
-            .any(|c| c.onvif_base().as_deref() == Some(base.as_str()))
-        {
-            self.toast("该设备已在列表里");
-            return;
+        if self.selected == index {
+            self.disconnect(false);
         }
-        let id = format!("onvif-{}", base.rsplit('/').next().unwrap_or("dev"));
-        let mut cam = Camera::new(id, dev.display_name(), String::new());
-        cam.onvif_url = Some(base.clone());
-        self.cfg.cameras.push(cam);
-        self.selected = self.cfg.cameras.len() - 1;
-        self.reset_zoom();
-        self.high_stream = true;
-        self.push_lv(
-            Level::Ok,
-            format!("加入设备 {}（{base}）", dev.display_name()),
-        );
+        self.selected = selection_after_delete(self.selected, index);
+        self.cfg.cameras.remove(index);
         self.persist_config();
-        self.connect_selected();
     }
-
     /// None 表示主动断开，Some 表示切换目标；同设备预览重连保留独立录像。
     fn stop_recording_unless(&mut self, device: Option<&str>) {
         if let Some(recorder) = &mut self.recorder {
@@ -1152,6 +1398,7 @@ impl XdView {
                 }
                 Event::Interrupted { retrying } => {
                     self.preview.invalidate();
+                    self.reconnecting = retrying;
                     self.conn = if retrying {
                         Conn::Connecting
                     } else {
@@ -1217,11 +1464,7 @@ impl XdView {
                     };
                     let full = xd_core::onvif::inject_credentials(&uri, &user, &pass);
                     if let Some(cam) = self.cfg.cameras.get_mut(self.selected) {
-                        cam.stream_url = full.clone();
-                        if cam.capabilities.ptz || cam.onvif_url.is_some() {
-                            cam.capabilities.ptz = true;
-                            cam.capabilities.zoom = true;
-                        }
+                        remember_stream_uri(cam, &uri);
                     }
                     self.push_lv(
                         Level::Ok,
@@ -1232,16 +1475,6 @@ impl XdView {
                     );
                     self.start_media(&full);
                     if self.cfg.settings.cache_enabled {
-                        let mut cam = self.current().cloned();
-                        if let Some(c) = &mut cam {
-                            // start_cache 读的是 cam.resolved_url，这里把刚拿到的地址写回去
-                            c.stream_url = full.clone();
-                        }
-                        if let Some(c) = cam {
-                            if let Some(slot) = self.cfg.cameras.get_mut(self.selected) {
-                                slot.stream_url = c.stream_url;
-                            }
-                        }
                         self.start_cache();
                     }
                 }
@@ -1718,236 +1951,309 @@ impl XdView {
                 egui::Frame::new()
                     .fill(pal.panel)
                     .stroke(egui::Stroke::new(1.0_f32, pal.border))
-                    .inner_margin(egui::Margin {
-                        left: 10,
-                        right: 10,
-                        top: 12,
-                        bottom: 12,
-                    }),
+                    .inner_margin(10),
             )
             .show(ctx, |ui| {
                 ui.horizontal(|ui| {
                     ui.label(
-                        egui::RichText::new("设备")
+                        egui::RichText::new("设备 · ")
                             .size(12.0)
                             .strong()
                             .color(pal.dim),
                     );
+                    ui.label(
+                        egui::RichText::new(self.cfg.cameras.len().to_string())
+                            .monospace()
+                            .size(12.0)
+                            .strong()
+                            .color(pal.text),
+                    );
                     ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                        let scanning = self.scanning;
-                        // 扫描结果放独立弹窗（原型的做法）；侧栏只留设备卡，
-                        // 免得同一台设备在上下两处各出现一次。
-                        let label = if scanning { "扫描中…" } else { "扫描局域网" };
-                        let btn = egui::Button::new(egui::RichText::new(label).size(12.0))
-                            .fill(if scanning {
-                                pal.warn_fill
-                            } else {
-                                egui::Color32::TRANSPARENT
-                            })
-                            .stroke(egui::Stroke::new(
-                                1.0_f32,
-                                if scanning {
-                                    pal.warn_stroke
-                                } else {
-                                    pal.accent_stroke
-                                },
-                            ))
-                            .corner_radius(6.0_f32);
-                        if ui.add(btn).clicked() {
-                            self.open_scan();
+                        let menu = egui::menu::menu_custom_button(
+                            ui,
+                            egui::Button::new("").min_size(egui::vec2(26.0, 26.0)),
+                            |ui| {
+                                ui.set_min_width(146.0);
+                                if device_menu_item(ui, &pal, "导入设备…", true, false).clicked()
+                                {
+                                    self.open_ie(false);
+                                    ui.close_menu();
+                                }
+                                if device_menu_item(ui, &pal, "导出设备…", true, false).clicked()
+                                {
+                                    self.open_ie(true);
+                                    ui.close_menu();
+                                }
+                            },
+                        );
+                        let response = menu.response.on_hover_text("导入 / 导出设备");
+                        let color = if response.hovered() {
+                            pal.text
+                        } else {
+                            pal.dim
+                        };
+                        for dx in [-4.0, 0.0, 4.0] {
+                            ui.painter().circle_filled(
+                                response.rect.center() + egui::vec2(dx, 0.0),
+                                1.1,
+                                color,
+                            );
+                        }
+                        if ui
+                            .add(
+                                egui::Button::new(
+                                    egui::RichText::new("＋ 添加").size(12.0).color(pal.ok),
+                                )
+                                .fill(egui::Color32::TRANSPARENT)
+                                .stroke(egui::Stroke::new(1.0_f32, pal.accent_stroke)),
+                            )
+                            .clicked()
+                        {
+                            self.open_add();
                         }
                     });
                 });
-                ui.add_space(8.0);
-
+                if let Some(error) = self.config_error.clone() {
+                    egui::Frame::new()
+                        .fill(pal.warn_fill)
+                        .stroke(egui::Stroke::new(1.0_f32, pal.warn_stroke))
+                        .show(ui, |ui| {
+                            ui.colored_label(pal.bad, format!("更改未保存：{error}"));
+                        });
+                    if ui.button("重试保存").clicked() {
+                        self.persist_config();
+                    }
+                }
+                ui.add_space(2.0);
+                let mut action: Option<(usize, u8)> = None;
                 egui::ScrollArea::vertical()
                     .id_salt("device_list")
-                    .auto_shrink(egui::Vec2b::new(false, true))
                     .show(ui, |ui| {
-                        let mut pick: Option<usize> = None;
+                        if self.cfg.cameras.is_empty() {
+                            let (add, import) = empty_device_state(ui, &pal);
+                            if add.clicked() {
+                                self.open_add();
+                            }
+                            if import.clicked() {
+                                self.open_ie(false);
+                            }
+                        }
                         for (i, cam) in self.cfg.cameras.iter().enumerate() {
                             let selected = i == self.selected;
                             let status = self.device_status(i);
-                            let frame = egui::Frame::new()
-                                .fill(if selected { pal.active_bg } else { pal.panel2 })
+                            let mut menu_left = f32::INFINITY;
+                            let failed = selected && matches!(self.conn, Conn::Failed(_));
+                            let card_rect = egui::Rect::from_min_size(
+                                ui.cursor().min,
+                                egui::vec2(ui.available_width(), 60.0),
+                            );
+                            let hovered = ui.rect_contains_pointer(card_rect);
+                            let failed_bg = if pal.light {
+                                egui::Color32::from_rgb(251, 238, 238)
+                            } else {
+                                egui::Color32::from_rgb(27, 19, 21)
+                            };
+                            let card = egui::Frame::new()
+                                .fill(if failed {
+                                    failed_bg
+                                } else if selected {
+                                    pal.active_bg
+                                } else {
+                                    pal.panel2
+                                })
                                 .stroke(egui::Stroke::new(
                                     1.0_f32,
-                                    if selected {
+                                    if failed {
+                                        pal.danger_stroke
+                                    } else if selected {
                                         pal.accent_stroke
+                                    } else if hovered {
+                                        pal.border_strong
                                     } else {
                                         pal.border
                                     },
                                 ))
-                                .corner_radius(8.0_f32)
-                                .inner_margin(egui::Margin {
-                                    left: 12,
-                                    right: 12,
-                                    top: 10,
-                                    bottom: 10,
-                                });
-                            let inner = frame.show(ui, |ui| {
-                                ui.set_min_width(ui.available_width());
-                                ui.horizontal(|ui| {
-                                    ui.label(
-                                        egui::RichText::new(cam.name.as_str())
-                                            .size(13.0)
-                                            .strong()
-                                            .color(if selected { pal.text } else { pal.dim }),
-                                    );
-                                    ui.with_layout(
-                                        egui::Layout::right_to_left(egui::Align::Center),
-                                        |ui| {
-                                            ui.label(
-                                                egui::RichText::new(cam.transport().as_str())
+                                .corner_radius(8.0)
+                                .inner_margin(egui::Margin::symmetric(11, 9))
+                                .show(ui, |ui| {
+                                    ui.set_min_width(ui.available_width());
+                                    ui.spacing_mut().item_spacing = egui::vec2(7.0, 5.0);
+                                    ui.horizontal(|ui| {
+                                        let status_width = ui.fonts(|fonts| {
+                                            fonts
+                                                .layout_no_wrap(
+                                                    status.0.to_owned(),
+                                                    egui::FontId::proportional(10.0),
+                                                    status.1,
+                                                )
+                                                .size()
+                                                .x
+                                        }) + 24.0;
+                                        let name_width =
+                                            (ui.available_width() - status_width - 22.0 - 14.0)
+                                                .max(0.0);
+                                        let response = ui
+                                            .add_sized(
+                                                [name_width, 20.0],
+                                                egui::Label::new(
+                                                    egui::RichText::new(&cam.name)
+                                                        .size(13.0)
+                                                        .strong(),
+                                                )
+                                                .truncate()
+                                                .halign(egui::Align::Min)
+                                                .sense(egui::Sense::click()),
+                                            )
+                                            .on_hover_text(&cam.name);
+                                        if response.clicked() {
+                                            action = Some((i, 0));
+                                        }
+                                        let status_response = tag(ui, status.0, status.1);
+                                        if selected {
+                                            if let Conn::Failed(error) = &self.conn {
+                                                status_response.on_hover_text(format!(
+                                                    "{}；请检查地址、账号与网络后重试",
+                                                    xd_core::onvif::mask_url_in_text(error)
+                                                ));
+                                            }
+                                        }
+                                        let menu = egui::menu::menu_custom_button(
+                                            ui,
+                                            egui::Button::new("")
+                                                .min_size(egui::vec2(22.0, 20.0))
+                                                .frame(false),
+                                            |ui| {
+                                                ui.set_min_width(146.0);
+                                                if device_menu_item(
+                                                    ui,
+                                                    &pal,
+                                                    if selected {
+                                                        "重新连接"
+                                                    } else {
+                                                        "播放"
+                                                    },
+                                                    true,
+                                                    false,
+                                                )
+                                                .clicked()
+                                                {
+                                                    action = Some((i, 1));
+                                                    ui.close_menu();
+                                                }
+                                                if device_menu_item(
+                                                    ui,
+                                                    &pal,
+                                                    "断开",
+                                                    selected && !matches!(self.conn, Conn::Idle),
+                                                    false,
+                                                )
+                                                .clicked()
+                                                {
+                                                    action = Some((i, 2));
+                                                    ui.close_menu();
+                                                }
+                                                ui.separator();
+                                                if device_menu_item(ui, &pal, "编辑", true, false)
+                                                    .clicked()
+                                                {
+                                                    action = Some((i, 3));
+                                                    ui.close_menu();
+                                                }
+                                                if device_menu_item(ui, &pal, "删除", true, true)
+                                                    .clicked()
+                                                {
+                                                    action = Some((i, 4));
+                                                    ui.close_menu();
+                                                }
+                                            },
+                                        );
+                                        let response = menu.response.on_hover_text("设备菜单");
+                                        if hovered || menu.inner.is_some() || response.has_focus() {
+                                            let center = response.rect.center();
+                                            let color =
+                                                if response.hovered() || response.has_focus() {
+                                                    pal.text
+                                                } else {
+                                                    pal.faint
+                                                };
+                                            for dx in [-4.0, 0.0, 4.0] {
+                                                ui.painter().circle_filled(
+                                                    center + egui::vec2(dx, 0.0),
+                                                    1.1,
+                                                    color,
+                                                );
+                                            }
+                                        }
+                                        menu_left = response.rect.left();
+                                    });
+                                    let address = cam
+                                        .onvif_url
+                                        .as_deref()
+                                        .and_then(address_host)
+                                        .or_else(|| address_host(&cam.stream_url))
+                                        .unwrap_or("地址未知");
+                                    if ui
+                                        .add(
+                                            egui::Label::new(
+                                                egui::RichText::new(address)
                                                     .monospace()
                                                     .size(10.0)
-                                                    .color(pal.faint),
-                                            );
-                                        },
-                                    );
+                                                    .color(pal.dim),
+                                            )
+                                            .truncate()
+                                            .sense(egui::Sense::click()),
+                                        )
+                                        .clicked()
+                                    {
+                                        action = Some((i, 0));
+                                    }
                                 });
-                                ui.add_space(4.0);
-                                ui.horizontal(|ui| {
-                                    ui.label(
-                                        egui::RichText::new(cam.id.as_str())
-                                            .monospace()
-                                            .size(10.0)
-                                            .color(pal.faint),
-                                    );
-                                    ui.with_layout(
-                                        egui::Layout::right_to_left(egui::Align::Center),
-                                        |ui| {
-                                            tag(ui, status.0, status.1);
-                                        },
-                                    );
-                                });
-                            });
-                            let resp = ui.interact(
-                                inner.response.rect,
-                                egui::Id::new(("device_card", i)),
-                                egui::Sense::click(),
-                            );
-                            if resp.clicked() {
-                                pick = Some(i);
+                            let mut hit = card.response.rect;
+                            hit.max.x = menu_left.clamp(hit.min.x, hit.max.x);
+                            if ui
+                                .interact(
+                                    hit,
+                                    egui::Id::new(("device_card", &cam.id)),
+                                    egui::Sense::click(),
+                                )
+                                .clicked()
+                            {
+                                action = Some((i, 0));
                             }
-                            if resp.hovered() {
-                                ui.ctx().set_cursor_icon(egui::CursorIcon::PointingHand);
-                            }
-                            ui.add_space(8.0);
+                            ui.add_space(3.0);
                         }
-                        if let Some(i) = pick {
-                            if self.selected != i {
-                                self.selected = i;
-                                self.reset_zoom();
-                            }
+                    });
+                if let Some((index, command)) = action {
+                    match command {
+                        0 => self.play_device(index),
+                        1 => {
+                            self.selected = index;
+                            self.reset_zoom();
                             self.connect_selected();
                         }
-
-                    });
-
-                // 底部：添加设备（手填 ONVIF）/ 连接断开 / 导入导出 / 说明。
-                // Layout::bottom_up 先加的排在最下面。
-                ui.with_layout(egui::Layout::bottom_up(egui::Align::Min), |ui| {
-                    // 扫描不到设备时的正路：手填 ONVIF 地址添加（小度/TP-Link 不支持 WS-Discovery）
-                    if ui
-                        .add_sized(
-                            [ui.available_width(), 28.0],
-                            egui::Button::new(
-                                egui::RichText::new("＋ 添加设备（手填 ONVIF）").size(12.0),
-                            )
-                            .fill(pal.accent_fill)
-                            .stroke(egui::Stroke::new(1.0_f32, pal.accent_stroke))
-                            .corner_radius(6.0_f32),
-                        )
-                        .clicked()
-                    {
-                        self.add_open = true;
-                        self.add_error.clear();
+                        2 => self.disconnect(true),
+                        3 => self.open_edit(index),
+                        4 => self.delete_device = self.cfg.cameras.get(index).map(|c| c.id.clone()),
+                        _ => {}
                     }
-                    ui.add_space(6.0);
-                    ui.horizontal(|ui| {
-                        if ui
-                            .add(
-                                egui::Button::new(egui::RichText::new("连接").size(12.0))
-                                    .fill(pal.panel2)
-                                    .stroke(egui::Stroke::new(1.0_f32, pal.border))
-                                    .corner_radius(6.0_f32),
-                            )
-                            .clicked()
-                        {
-                            self.connect_selected();
-                        }
-                        if ui
-                            .add(
-                                egui::Button::new(egui::RichText::new("断开").size(12.0))
-                                    .fill(pal.panel2)
-                                    .stroke(egui::Stroke::new(1.0_f32, pal.danger_stroke))
-                                    .corner_radius(6.0_f32),
-                            )
-                            .clicked()
-                        {
-                            self.disconnect(true);
-                        }
-                    });
-                    ui.add_space(6.0);
-                    ui.horizontal(|ui| {
-                        if ui
-                            .add(
-                                egui::Button::new(egui::RichText::new("导入设备").size(12.0))
-                                    .fill(pal.panel2)
-                                    .stroke(egui::Stroke::new(1.0_f32, pal.border))
-                                    .corner_radius(6.0_f32),
-                            )
-                            .clicked()
-                        {
-                            self.open_ie(false);
-                        }
-                        if ui
-                            .add(
-                                egui::Button::new(egui::RichText::new("导出设备").size(12.0))
-                                    .fill(pal.panel2)
-                                    .stroke(egui::Stroke::new(1.0_f32, pal.border))
-                                    .corner_radius(6.0_f32),
-                            )
-                            .clicked()
-                        {
-                            self.open_ie(true);
-                        }
-                    });
-                    ui.add_space(8.0);
-                    ui.label(
-                        egui::RichText::new(
-                            "一次只连一路。断流的设备会按指数退避自动重连。\nONVIF 地址填到主机即可（如 http://192.168.1.64:8080），\n流地址经 GetStreamUri 自动获取。",
-                        )
-                        .size(11.0)
-                        .color(pal.faint),
-                    );
-                    if !self.device_info.is_empty() {
-                        ui.label(
-                            egui::RichText::new(self.device_info.as_str())
-                                .monospace()
-                                .size(10.0)
-                                .color(pal.faint),
-                        );
-                    }
-                });
+                }
             });
     }
 
-    /// 设备卡片右下角的状态标签。
     fn device_status(&self, i: usize) -> (&'static str, egui::Color32) {
-        let pal = &self.pal;
         if i != self.selected {
-            return ("未连接", pal.faint);
+            return ("未连接", self.pal.faint);
         }
         match &self.conn {
-            Conn::Live { .. } => ("在线", pal.ok),
-            Conn::Connecting => ("连接中", pal.warn),
-            Conn::Failed(_) => ("失败", pal.bad),
-            Conn::Idle => ("未连接", pal.faint),
+            Conn::Live { .. } if self.preview.paused => ("已暂停", self.pal.warn),
+            Conn::Live { .. } if self.preview.is_live() => ("播放中", self.pal.ok),
+            Conn::Live { .. } => ("等待画面", self.pal.info),
+            Conn::Connecting if self.reconnecting => ("重连中", self.pal.warn),
+            Conn::Connecting => ("连接中", self.pal.info),
+            Conn::Failed(_) => ("连接失败", self.pal.bad),
+            Conn::Idle => ("未连接", self.pal.faint),
         }
     }
-
     /// 数字变焦：以归一化锚点 `anchor`（0..=1，画面内）为不动点缩放 `factor` 倍。
     fn apply_zoom(&mut self, factor: f32, anchor: egui::Vec2) {
         let new_zoom = (self.zoom * factor).clamp(1.0, 8.0);
@@ -1992,7 +2298,6 @@ impl XdView {
             self.view_mode = self.view_mode.after_enter_focus();
             self.ie_open = false;
             self.add_open = false;
-            self.scan_open = false;
             self.add_error.clear();
             // 专注态没有侧栏，允许缩成小窗；普通态三栏需要 1100×700 起步
             ctx.send_viewport_cmd(egui::ViewportCommand::MinInnerSize(egui::vec2(
@@ -3351,428 +3656,326 @@ impl XdView {
         if !self.ie_open {
             return;
         }
-        let mut open = true;
         let mut do_close = false;
-        egui::Window::new("设备导入 / 导出")
-            .open(&mut open)
-            .collapsible(false)
-            .resizable(false)
-            .default_width(560.0)
-            .show(ctx, |ui| {
-                ui.label(
-                    egui::RichText::new(
-                        "每台设备一段 [[camera]]（格式与 config.toml 相同）。导出内容含明文密码，注意保管。",
-                    )
-                    .size(11.0)
-                    .color(pal.faint),
-                );
-                ui.add_space(6.0);
-                ui.add(
-                    egui::TextEdit::multiline(&mut self.ie_text)
-                        .desired_width(f32::INFINITY)
-                        .desired_rows(16)
-                        .font(egui::TextStyle::Monospace),
-                );
-                if !self.ie_error.is_empty() {
+        let body_height = (ctx.screen_rect().height() - 170.0).max(60.0);
+        let modal = device_modal(ctx, "device_import_export", &pal, 560.0, |ui| {
+            do_close |= device_modal_header(ui, &pal, "设备导入 / 导出");
+            egui::Frame::new().inner_margin(egui::Margin::symmetric(18, 14)).show(ui, |ui| {
+                egui::ScrollArea::vertical().max_height(body_height).show(ui, |ui| {
+                    device_notice(ui, &pal, "每台设备一段 [[camera]]，格式与 config.toml 相同。导出内容含明文密码，请妥善保管。", true);
+                    ui.add_space(10.0);
+                    ui.label(egui::RichText::new("设备配置（TOML）").size(11.0).color(pal.dim));
                     ui.add_space(4.0);
-                    ui.label(egui::RichText::new(&self.ie_error).size(11.0).color(pal.bad));
-                }
-                ui.add_space(8.0);
-                ui.horizontal(|ui| {
-                    if ui.button("复制").clicked() {
-                        ui.ctx().copy_text(self.ie_text.clone());
-                        self.toast("已复制到剪贴板");
+                    ui.add(egui::TextEdit::multiline(&mut self.ie_text).desired_width(f32::INFINITY)
+                        .desired_rows(12).font(egui::TextStyle::Monospace));
+                    if !self.ie_error.is_empty() {
+                        ui.add_space(6.0);
+                        ui.label(egui::RichText::new(&self.ie_error).size(11.0).color(pal.bad));
                     }
-                    if ui.button("保存到文件").clicked() {
-                        self.save_devices_file();
-                    }
-                    if ui.button("导入并合并").clicked() {
-                        self.import_devices();
-                    }
+                });
+            });
+            ui.separator();
+            egui::Frame::new()
+                .inner_margin(egui::Margin::symmetric(18, 12))
+                .show(ui, |ui| {
                     ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                        if ui.button("关闭").clicked() {
+                        if device_button(ui, &pal, "导入并合并", 1).clicked() {
+                            self.import_devices();
+                        }
+                        if device_button(ui, &pal, "保存到文件", 0).clicked() {
+                            self.save_devices_file();
+                        }
+                        if device_button(ui, &pal, "复制", 0).clicked() {
+                            ui.ctx().copy_text(self.ie_text.clone());
+                            self.toast("已复制到剪贴板");
+                        }
+                        if device_button(ui, &pal, "关闭", 0).clicked() {
                             do_close = true;
                         }
                     });
                 });
-            });
-        if !open || do_close {
+        });
+        if do_close || modal.backdrop_response.clicked() {
             self.ie_open = false;
         }
     }
 
     /// 「添加设备」弹窗：手填 ONVIF 地址/账号（扫描不可用时的正路）。
-    /// 扫描弹窗：结果、进度、失败说明都在这里，侧栏只保留设备卡。
-    ///
-    /// 「接入」直接走 `adopt()`（GetProfiles → GetStreamUri → 写 config.toml），
-    /// 成功后该条变「已接入」；点已接入的那条会关掉弹窗并切到该设备。
-    fn draw_scan_window(&mut self, ctx: &egui::Context) {
-        let pal = self.pal;
-        if !self.scan_open {
-            return;
-        }
-        let mut open = true;
-        let mut restart = false;
-        let mut manual = false;
-        let mut close_clicked = false;
-        let mut pick: Option<usize> = None;
-        egui::Window::new("扫描局域网")
-            .open(&mut open)
-            .collapsible(false)
-            .resizable(false)
-            .default_width(460.0)
-            .show(ctx, |ui| {
-                ui.label(
-                    egui::RichText::new(
-                        "WS-Discovery 组播 + 网段探测，只覆盖同一广播域；设备需已开启 ONVIF。",
-                    )
-                    .size(11.0)
-                    .color(pal.faint),
-                );
-                ui.add_space(10.0);
-
-                // 三种状态都画在同一块固定高度里，弹窗高度保持稳定
-                ui.set_min_width(430.0);
-                ui.allocate_ui_with_layout(
-                    egui::vec2(ui.available_width(), SCAN_BODY_H),
-                    egui::Layout::top_down(egui::Align::Min),
-                    |ui| {
-                        // allocate_ui_with_layout 只限制不占位，要显式撑到固定高度
-                        ui.set_min_height(SCAN_BODY_H);
-                if self.scanning {
-                    ui.add_space((SCAN_BODY_H - 64.0) * 0.5);
-                    ui.horizontal(|ui| {
-                        ui.add(egui::Spinner::new().size(16.0));
-                        ui.label(
-                            egui::RichText::new("正在探测局域网内的 ONVIF 设备…")
-                                .size(12.0)
-                                .color(pal.dim),
-                        );
-                    });
-                    ui.add_space(6.0);
-                    ui.label(
-                        egui::RichText::new(
-                            "小度、TP-Link(Tapo) 等不响应 WS-Discovery，扫不到属正常，可手动填写地址。",
-                        )
-                        .size(11.0)
-                        .color(pal.faint),
-                    );
-                } else if self.discovered.is_empty() {
-                    ui.add_space((SCAN_BODY_H - 96.0) * 0.5);
-                    let (title, color) = match &self.scan_error {
-                        Some(e) => (e.clone(), pal.bad),
-                        None => ("没有发现设备。".to_string(), pal.warn),
-                    };
-                    ui.label(egui::RichText::new(title).size(12.0).color(color));
-                    ui.add_space(4.0);
-                    ui.label(
-                        egui::RichText::new(
-                            "确认设备已开启 ONVIF、与电脑同网段、防火墙放行 UDP 3702；\
-                             不响应组播的设备请用「手动添加」。",
-                        )
-                        .size(11.0)
-                        .color(pal.faint),
-                    );
-                } else {
-                    ui.label(
-                        egui::RichText::new(format!(
-                            "发现 {} 台 ONVIF 设备",
-                            self.discovered.len()
-                        ))
-                        .size(11.0)
-                        .strong()
-                        .color(pal.dim),
-                    );
-                    ui.add_space(6.0);
-                    let list = self.discovered.clone();
-                    egui::ScrollArea::vertical()
-                        .id_salt("scan_list")
-                        .max_height(SCAN_BODY_H - 26.0)
-                        .auto_shrink([false, true])
-                        .show(ui, |ui| {
-                            for dev in &list {
-                                let url = dev.base_url().unwrap_or_else(|| dev.endpoint.clone());
-                                let name = dev.display_name();
-                                // 和设备列表一样按 ONVIF 入口匹配：设备自报的名字和 config
-                                // 里的 name 常常不同，标题用列表里的那个才对得上号。
-                                let linked = self
-                                    .cfg
-                                    .cameras
-                                    .iter()
-                                    .position(|c| c.onvif_base().as_deref() == Some(url.as_str()));
-                                let title = match linked {
-                                    Some(i) => self.cfg.cameras[i].name.clone(),
-                                    None if name == url => "ONVIF 设备".to_string(),
-                                    None => name,
-                                };
-                                let card = egui::Frame::new()
-                                    .fill(pal.panel2)
-                                    .stroke(egui::Stroke::new(
-                                        1.0_f32,
-                                        if linked.is_some() {
-                                            pal.accent_stroke
-                                        } else {
-                                            pal.border
-                                        },
-                                    ))
-                                    .corner_radius(8.0_f32)
-                                    .inner_margin(egui::Margin {
-                                        left: 13,
-                                        right: 13,
-                                        top: 11,
-                                        bottom: 11,
-                                    })
-                                    .show(ui, |ui| {
-                                        ui.horizontal(|ui| {
-                                            ui.allocate_ui_with_layout(
-                                                egui::vec2((ui.available_width() - 74.0).max(120.0), 18.0),
-                                                egui::Layout::left_to_right(egui::Align::Center),
-                                                |ui| {
-                                                    ui.add(
-                                                        egui::Label::new(
-                                                            egui::RichText::new(title)
-                                                                .size(13.0)
-                                                                .strong()
-                                                                .color(pal.text),
-                                                        )
-                                                        .truncate(),
-                                                    );
-                                                },
-                                            );
-                                            ui.with_layout(
-                                                egui::Layout::right_to_left(egui::Align::Center),
-                                                |ui| {
-                                                    if let Some(i) = linked {
-                                                        // "已接入" 只代表进了配置；连接是否成功要看 conn。
-                                                        // 只有当前选中的设备有连接状态，其余如实显示「已加入」。
-                                                        let (label, color) = if i == self.selected {
-                                                            self.short_status()
-                                                        } else {
-                                                            ("已加入", pal.dim)
-                                                        };
-                                                        ui.label(
-                                                            egui::RichText::new(label)
-                                                                .size(11.0)
-                                                                .color(color),
-                                                        );
-                                                    } else if ui
-                                                        .add(
-                                                            egui::Button::new(
-                                                                egui::RichText::new("接入")
-                                                                    .size(11.0)
-                                                                    .color(pal.ok),
-                                                            )
-                                                            .fill(pal.panel2)
-                                                            .stroke(egui::Stroke::new(
-                                                                1.0_f32,
-                                                                pal.accent_stroke,
-                                                            ))
-                                                            .corner_radius(6.0_f32),
-                                                        )
-                                                        .clicked()
-                                                    {
-                                                        self.adopt(dev);
-                                                    }
-                                                },
-                                            );
-                                        });
-                                        ui.add_space(3.0);
-                                        ui.add(
-                                            egui::Label::new(
-                                                egui::RichText::new(url.clone())
-                                                    .monospace()
-                                                    .size(10.0)
-                                                    .color(pal.dim),
-                                            )
-                                            .truncate(),
-                                        );
-                                    });
-                                if let Some(i) = linked {
-                                    let hit = ui
-                                        .interact(
-                                            card.response.rect,
-                                            ui.id().with(("scan", url.as_str())),
-                                            egui::Sense::click(),
-                                        )
-                                        .on_hover_text("已接入 · 点击切到该设备");
-                                    if hit.hovered() {
-                                        ui.ctx().set_cursor_icon(egui::CursorIcon::PointingHand);
-                                        ui.painter_at(card.response.rect).rect_stroke(
-                                            card.response.rect,
-                                            8.0_f32,
-                                            egui::Stroke::new(1.0_f32, pal.accent_stroke),
-                                            egui::StrokeKind::Inside,
-                                        );
-                                    }
-                                    if hit.clicked() {
-                                        pick = Some(i);
-                                    }
-                                }
-                                ui.add_space(8.0);
-                            }
-                        });
-                }
-                    },
-                );
-
-                ui.add_space(10.0);
-                ui.separator();
-                ui.add_space(6.0);
-                ui.horizontal(|ui| {
-                    if ui
-                        .add_enabled(
-                            !self.scanning,
-                            egui::Button::new(egui::RichText::new("重新扫描").size(12.0)),
-                        )
-                        .clicked()
-                    {
-                        restart = true;
-                    }
-                    if ui
-                        .add(egui::Button::new(
-                            egui::RichText::new("手动添加").size(12.0),
-                        ))
-                        .clicked()
-                    {
-                        manual = true;
-                    }
-                    ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                        if ui
-                            .add(egui::Button::new(
-                                egui::RichText::new("关闭").size(12.0),
-                            ))
-                            .clicked()
-                        {
-                            close_clicked = true;
-                        }
-                    });
-                });
-                ui.add_space(4.0);
-                ui.label(
-                    egui::RichText::new(
-                        "接入 = 加入设备列表并尝试起播（写入 config.toml）；需要账号/鉴权的设备可能连接失败。",
-                    )
-                    .size(10.0)
-                    .color(pal.faint),
-                );
-            });
-
-        if restart {
-            self.start_scan();
-        }
-        if manual {
-            self.scan_open = false;
-            self.add_open = true;
-            self.add_error.clear();
-        }
-        if let Some(i) = pick {
-            self.scan_open = false;
-            // 已经在这台设备上播放/连接时才跳过；失败、空闲都要重连——
-            // 拉流失败后 Stream 对象仍然存在，不能拿 stream.is_none() 当判据。
-            let busy = matches!(self.conn, Conn::Live { .. } | Conn::Connecting);
-            if self.selected != i || !busy {
-                self.selected = i;
-                self.reset_zoom();
-                self.connect_selected();
-            }
-        }
-        if close_clicked || !open {
-            self.scan_open = false;
-        }
-    }
-
+    /// 添加和编辑共用表单；发现由用户主动启动，保存与播放分别选择。
     fn draw_add_window(&mut self, ctx: &egui::Context) {
-        let pal = self.pal;
         if !self.add_open {
             return;
         }
         let mut open = true;
-        let mut do_close = false;
-        egui::Window::new("添加设备")
-            .open(&mut open)
-            .collapsible(false)
-            .resizable(false)
-            .default_width(400.0)
-            .show(ctx, |ui| {
-                ui.label(
-                    egui::RichText::new(
-                        "扫描找不到设备时手填（小度/TP-Link 等不支持 WS-Discovery）。地址可只写到主机。",
-                    )
-                    .size(11.0)
-                    .color(pal.faint),
-                );
-                ui.add_space(8.0);
-                ui.horizontal(|ui| {
-                    ui.add_sized([64.0, 20.0], egui::Label::new(egui::RichText::new("名称").size(12.0).color(pal.dim)));
-                    ui.add(
-                        egui::TextEdit::singleline(&mut self.add_name)
-                            .hint_text("可留空，默认用地址")
-                            .desired_width(f32::INFINITY),
-                    );
-                });
-                ui.add_space(6.0);
-                ui.horizontal(|ui| {
-                    ui.add_sized([64.0, 20.0], egui::Label::new(egui::RichText::new("ONVIF 地址").size(12.0).color(pal.dim)));
-                    ui.add(
-                        egui::TextEdit::singleline(&mut self.add_url)
-                            .hint_text("http://192.168.1.64:8080")
-                            .desired_width(f32::INFINITY)
-                            .font(egui::TextStyle::Monospace),
-                    );
-                });
-                ui.add_space(6.0);
-                ui.horizontal(|ui| {
-                    ui.add_sized([64.0, 20.0], egui::Label::new(egui::RichText::new("用户名").size(12.0).color(pal.dim)));
-                    ui.add(
-                        egui::TextEdit::singleline(&mut self.add_user)
-                            .desired_width(130.0),
-                    );
-                    ui.add_space(10.0);
-                    ui.add_sized([32.0, 20.0], egui::Label::new(egui::RichText::new("密码").size(12.0).color(pal.dim)));
-                    ui.add(
-                        egui::TextEdit::singleline(&mut self.add_pass)
-                            .password(true)
-                            .desired_width(130.0),
-                    );
-                });
-                if !self.add_error.is_empty() {
-                    ui.add_space(4.0);
-                    ui.label(egui::RichText::new(&self.add_error).size(11.0).color(pal.bad));
-                }
-                ui.add_space(10.0);
-                ui.horizontal(|ui| {
-                    if ui
-                        .add(
-                            egui::Button::new(egui::RichText::new("添加并连接").size(12.0))
-                                .fill(pal.accent_fill)
-                                .stroke(egui::Stroke::new(1.0_f32, pal.accent_stroke))
-                                .corner_radius(6.0_f32),
-                        )
-                        .clicked()
-                    {
-                        self.add_device_manual();
-                        if self.add_error.is_empty() {
-                            do_close = true;
+        let mut submit = None;
+        let mut cancel = false;
+        let mut scan = false;
+        let mut discovered = None;
+        let mut play_existing = None;
+        let editing = self.device_form.editing.is_some();
+        let pal = self.pal;
+        let body_height =
+            (ctx.screen_rect().height() - if editing { 170.0 } else { 215.0 }).max(60.0);
+        let modal = device_modal(ctx, "device_edit", &pal, 560.0, |ui| {
+            cancel |= device_modal_header(
+                ui,
+                &pal,
+                if editing {
+                    "编辑设备"
+                } else {
+                    "添加设备"
+                },
+            );
+            if !editing {
+                egui::Frame::new()
+                    .inner_margin(egui::Margin {
+                        left: 18,
+                        right: 18,
+                        top: 8,
+                        bottom: 0,
+                    })
+                    .show(ui, |ui| {
+                        ui.horizontal(|ui| {
+                            ui.spacing_mut().item_spacing.x = 2.0;
+                            for (tab, label) in [
+                                (DeviceTab::Discover, "局域网发现"),
+                                (DeviceTab::Onvif, "ONVIF"),
+                                (DeviceTab::Stream, "流地址"),
+                            ] {
+                                if device_tab_button(ui, &pal, label, self.device_tab == tab)
+                                    .clicked()
+                                {
+                                    self.device_tab = tab;
+                                }
+                            }
+                        });
+                    });
+                ui.separator();
+            }
+            egui::Frame::new().inner_margin(egui::Margin::symmetric(18, 14)).show(ui, |ui| {
+                egui::ScrollArea::vertical().id_salt("device_form_body").max_height(body_height).show(ui, |ui| {
+                    if !editing && self.device_tab == DeviceTab::Discover {
+                        ui.horizontal(|ui| {
+                            ui.label(egui::RichText::new("打开窗口不自动扫描，手动开始探测").size(11.0).color(pal.faint));
+                            ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                                ui.add_enabled_ui(!self.scanning, |ui| {
+                                    if device_button(ui, &pal, if self.scanning { "扫描中…" } else { "开始扫描" }, 0).clicked() { scan = true; }
+                                });
+                            });
+                        });
+                        ui.add_space(10.0);
+                        if let Some(error) = &self.scan_error {
+                            ui.label(egui::RichText::new(xd_core::onvif::mask_url_in_text(error)).size(11.0).color(pal.bad));
+                            ui.add_space(8.0);
+                        }
+                        if self.discovered.is_empty() {
+                            ui.label(egui::RichText::new("扫描不到时可切换到 ONVIF 或流地址手动填写。").size(11.0).color(pal.faint));
+                        }
+                        for dev in &self.discovered {
+                            let Some(base) = dev.base_url() else { continue; };
+                            let Some(normalized) = normalized_onvif(&base).ok() else { continue; };
+                            let linked = self.cfg.cameras.iter().position(|c| c.onvif_url.as_deref().and_then(|v| normalized_onvif(v).ok()).as_ref() == Some(&normalized));
+                            let title = xd_core::onvif::mask_url_in_text(&dev.display_name());
+                            egui::Frame::new().fill(pal.panel2).stroke(egui::Stroke::new(1.0_f32, if linked.is_some() { pal.accent_stroke } else { pal.border }))
+                                .corner_radius(8.0).inner_margin(egui::Margin::symmetric(13, 11)).show(ui, |ui| {
+                                ui.set_min_width(ui.available_width());
+                                ui.horizontal(|ui| {
+                                    let button_width = if linked.is_some() { 100.0 } else { 58.0 };
+                                    let text_width = (ui.available_width() - button_width - 8.0).max(0.0);
+                                    ui.allocate_ui_with_layout(egui::vec2(text_width, 38.0), egui::Layout::top_down(egui::Align::Min), |ui| {
+                                        ui.add(egui::Label::new(egui::RichText::new(&title).size(13.0).strong()).truncate());
+                                        ui.add(egui::Label::new(egui::RichText::new(address_host(&base).unwrap_or("地址未知")).monospace().size(10.0).color(pal.dim)).truncate());
+                                    });
+                                    if let Some(i) = linked {
+                                        if device_button(ui, &pal, "播放已有设备", 3).clicked() { play_existing = Some(i); }
+                                    } else if device_button(ui, &pal, "选择", 0).clicked() { discovered = Some((title.clone(), base.clone())); }
+                                });
+                            });
+                            ui.add_space(8.0);
+                        }
+                    } else {
+                        if let Some(id) = &self.device_form.editing {
+                            let mut id_text = id.clone();
+                            device_form_row(ui, &pal,
+                                ("名称（留空使用主机名）", &mut self.device_form.name, "如：书房", false, true),
+                                ("设备 ID（只读）", &mut id_text, "", false, false));
+                        } else {
+                            device_field(ui, &pal, "名称（留空使用主机名）", &mut self.device_form.name, "如：书房", false, true);
+                        }
+                        if editing || self.device_tab == DeviceTab::Onvif {
+                            device_field(ui, &pal, "ONVIF 服务地址", &mut self.device_form.onvif, "http://主机:端口", false, true);
+                        }
+                        if editing {
+                            device_form_row(ui, &pal,
+                                ("主流地址", &mut self.device_form.stream, "留空时通过 ONVIF 获取", false, true),
+                                ("子流地址（可选）", &mut self.device_form.sub_stream, "可选", false, true));
+                        } else if self.device_tab == DeviceTab::Stream {
+                            device_field(ui, &pal, "主流地址", &mut self.device_form.stream, "rtsp://主机:端口/路径", false, true);
+                            device_field(ui, &pal, "子流地址（可选）", &mut self.device_form.sub_stream, "可选", false, true);
+                        }
+                        if editing {
+                            ui.columns(2, |columns| {
+                                device_field(&mut columns[0], &pal, "用户名", &mut self.device_form.user, "", false, true);
+                                device_password_field(&mut columns[1], &pal, &mut self.device_form.pass, &mut self.device_password_visible);
+                            });
+                        } else {
+                            device_form_row(ui, &pal,
+                                ("用户名", &mut self.device_form.user, "", false, true),
+                                ("密码", &mut self.device_form.pass, "", true, true));
+                        }
+                        if editing {
+                            ui.label(egui::RichText::new("仅改名称不重连；修改当前设备连接信息将停止录像与缓存、取消导出并重连。").size(11.0).color(pal.faint));
+                        } else if self.device_tab == DeviceTab::Onvif {
+                            ui.label(egui::RichText::new("流地址将在连接时经 GetStreamUri 自动获取，无需手填。").size(11.0).color(pal.faint));
                         }
                     }
-                    if ui
-                        .add(
-                            egui::Button::new(egui::RichText::new("取消").size(12.0))
-                                .fill(pal.panel2)
-                                .stroke(egui::Stroke::new(1.0_f32, pal.border))
-                                .corner_radius(6.0_f32),
-                        )
-                        .clicked()
-                    {
-                        do_close = true;
+                    if !self.add_error.is_empty() {
+                        ui.add_space(6.0);
+                        ui.label(egui::RichText::new(&self.add_error).size(11.0).color(pal.bad));
                     }
                 });
             });
-        if !open || do_close {
-            self.add_open = false;
+            ui.separator();
+            egui::Frame::new()
+                .inner_margin(egui::Margin::symmetric(18, 12))
+                .show(ui, |ui| {
+                    ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                        if editing || self.device_tab != DeviceTab::Discover {
+                            if !editing && device_button(ui, &pal, "保存并播放", 0).clicked() {
+                                submit = Some(true);
+                            }
+                            let changed_current =
+                                matches!(self.conn, Conn::Connecting | Conn::Live { .. })
+                                    && self.device_form.editing.as_ref().is_some_and(|id| {
+                                        self.current().is_some_and(|c| {
+                                            &c.id == id && connection_changed(c, &self.device_form)
+                                        })
+                                    });
+                            if device_button(
+                                ui,
+                                &pal,
+                                if changed_current {
+                                    "保存并重连"
+                                } else {
+                                    "保存"
+                                },
+                                1,
+                            )
+                            .clicked()
+                            {
+                                submit = Some(false);
+                            }
+                        }
+                        if device_button(ui, &pal, "取消", 0).clicked() {
+                            cancel = true;
+                        }
+                    });
+                });
+        });
+        if scan {
+            self.start_scan();
         }
+        if cancel || modal.backdrop_response.clicked() {
+            open = false;
+        }
+        if let Some((name, base)) = discovered {
+            self.device_form.name = name;
+            self.device_form.onvif = base;
+            self.device_tab = DeviceTab::Onvif;
+        }
+        if let Some(i) = play_existing {
+            self.play_device(i);
+            open = false;
+        }
+        if let Some(play) = submit {
+            let required_missing = !editing
+                && ((self.device_tab == DeviceTab::Onvif
+                    && self.device_form.onvif.trim().is_empty())
+                    || (self.device_tab == DeviceTab::Stream
+                        && self.device_form.stream.trim().is_empty()));
+            let result = if required_missing {
+                Err("请填写此接入方式的地址".to_owned())
+            } else {
+                self.save_device_form(play)
+            };
+            match result {
+                Ok(()) => open = false,
+                Err(e) => self.add_error = e,
+            }
+        }
+        self.add_open = open;
     }
 
+    fn draw_delete_window(&mut self, ctx: &egui::Context) {
+        let Some(id) = self.delete_device.clone() else {
+            return;
+        };
+        let Some(cam) = self.cfg.cameras.iter().find(|c| c.id == id) else {
+            self.delete_device = None;
+            return;
+        };
+        let current = self.current().is_some_and(|c| c.id == id);
+        let mut open = true;
+        let mut delete = false;
+        let mut cancel = false;
+        let pal = self.pal;
+        let modal = device_modal(ctx, "device_delete", &pal, 440.0, |ui| {
+            cancel |= device_modal_header(ui, &pal, "删除设备");
+            egui::Frame::new()
+                .inner_margin(egui::Margin::symmetric(18, 14))
+                .show(ui, |ui| {
+                    egui::ScrollArea::vertical()
+                        .max_height((ctx.screen_rect().height() - 170.0).max(60.0))
+                        .show(ui, |ui| {
+                            ui.label(
+                                egui::RichText::new(format!("确定移除“{}”？", cam.name))
+                                    .size(13.0)
+                                    .color(pal.text),
+                            );
+                            ui.add_space(6.0);
+                            ui.label(
+                                egui::RichText::new(
+                                    "仅移除设备配置，已有录像、截图和缓存文件全部保留。",
+                                )
+                                .size(12.0)
+                                .color(pal.dim),
+                            );
+                            if current {
+                                ui.add_space(10.0);
+                                device_notice(
+                                    ui,
+                                    &pal,
+                                    "当前播放将断开，录像和缓存将停止，导出将取消。",
+                                    true,
+                                );
+                            }
+                        });
+                });
+            ui.separator();
+            egui::Frame::new()
+                .inner_margin(egui::Margin::symmetric(18, 12))
+                .show(ui, |ui| {
+                    ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                        if device_button(ui, &pal, "删除", 2).clicked() {
+                            delete = true;
+                        }
+                        if device_button(ui, &pal, "取消", 0).clicked() {
+                            cancel = true;
+                        }
+                    });
+                });
+        });
+        if delete {
+            self.delete_camera(&id);
+            open = false;
+        }
+        if cancel || modal.backdrop_response.clicked() {
+            open = false;
+        }
+        if !open {
+            self.delete_device = None;
+        }
+    }
     fn draw_toast(&mut self, ctx: &egui::Context) {
         let pal = self.pal;
         let Some(until) = self.note_until else {
@@ -3871,8 +4074,8 @@ impl eframe::App for XdView {
             if self.add_open {
                 self.add_open = false;
                 self.add_error.clear();
-            } else if self.scan_open {
-                self.scan_open = false;
+            } else if self.delete_device.is_some() {
+                self.delete_device = None;
             } else if self.ie_open {
                 self.ie_open = false;
             } else if is_fullscreen(ctx) {
@@ -3891,8 +4094,8 @@ impl eframe::App for XdView {
             self.draw_video(ctx);
         }
         self.draw_ie_window(ctx);
-        self.draw_scan_window(ctx);
         self.draw_add_window(ctx);
+        self.draw_delete_window(ctx);
         self.draw_toast(ctx);
 
         if matches!(self.conn, Conn::Live { .. }) {
@@ -3916,6 +4119,261 @@ impl eframe::App for XdView {
 }
 
 // ---------------------------------------------------------------------------- 绘制小部件
+
+/// 设备管理弹层共用遮罩与面板；正文自行限高滚动，标题和操作栏保持可见。
+fn device_modal<R>(
+    ctx: &egui::Context,
+    id: &'static str,
+    pal: &Palette,
+    width: f32,
+    add: impl FnOnce(&mut egui::Ui) -> R,
+) -> egui::ModalResponse<R> {
+    let width = width.min(ctx.screen_rect().width() * 0.92).max(1.0);
+    egui::Modal::new(egui::Id::new(id))
+        .backdrop_color(egui::Color32::from_black_alpha(179))
+        .frame(
+            egui::Frame::new()
+                .fill(pal.panel)
+                .stroke(egui::Stroke::new(1.0_f32, pal.border_strong))
+                .corner_radius(10.0)
+                .shadow(egui::epaint::Shadow {
+                    offset: [0, 16],
+                    blur: 32,
+                    spread: 0,
+                    color: egui::Color32::from_black_alpha(if pal.light { 56 } else { 150 }),
+                }),
+        )
+        .show(ctx, |ui| {
+            ui.set_width(width);
+            ui.spacing_mut().item_spacing.y = 0.0;
+            add(ui)
+        })
+}
+
+fn device_modal_header(ui: &mut egui::Ui, pal: &Palette, title: &str) -> bool {
+    let mut close = false;
+    egui::Frame::new()
+        .inner_margin(egui::Margin::symmetric(18, 14))
+        .show(ui, |ui| {
+            ui.horizontal(|ui| {
+                ui.label(
+                    egui::RichText::new(title)
+                        .size(14.0)
+                        .strong()
+                        .color(pal.text),
+                );
+                ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                    let response = ui
+                        .add(
+                            egui::Button::new("")
+                                .min_size(egui::vec2(24.0, 22.0))
+                                .frame(false),
+                        )
+                        .on_hover_text("关闭");
+                    let rect = egui::Rect::from_center_size(
+                        response.rect.center(),
+                        egui::vec2(10.0, 10.0),
+                    );
+                    let stroke = egui::Stroke::new(
+                        1.3_f32,
+                        if response.hovered() {
+                            pal.text
+                        } else {
+                            pal.faint
+                        },
+                    );
+                    ui.painter()
+                        .line_segment([rect.left_top(), rect.right_bottom()], stroke);
+                    ui.painter()
+                        .line_segment([rect.right_top(), rect.left_bottom()], stroke);
+                    close = response.clicked();
+                });
+            });
+        });
+    ui.separator();
+    close
+}
+
+fn device_menu_item(
+    ui: &mut egui::Ui,
+    pal: &Palette,
+    text: &str,
+    enabled: bool,
+    danger: bool,
+) -> egui::Response {
+    ui.scope(|ui| {
+        ui.visuals_mut().widgets.inactive.weak_bg_fill = egui::Color32::TRANSPARENT;
+        ui.visuals_mut().widgets.inactive.bg_stroke = egui::Stroke::NONE;
+        ui.visuals_mut().widgets.hovered.weak_bg_fill =
+            if danger { pal.danger_fill } else { pal.panel2 };
+        ui.visuals_mut().widgets.hovered.bg_stroke = egui::Stroke::NONE;
+        // 父菜单已按内容定宽并左对齐；不能在测量期占用整个剩余空间。
+        ui.add_enabled(
+            enabled,
+            egui::Button::new(egui::RichText::new(text).size(12.0).color(if !enabled {
+                pal.faint
+            } else if danger {
+                pal.bad
+            } else {
+                pal.text
+            }))
+            .min_size(egui::vec2(0.0, 28.0))
+            .corner_radius(5.0),
+        )
+    })
+    .inner
+}
+
+fn device_button(ui: &mut egui::Ui, pal: &Palette, text: &str, kind: u8) -> egui::Response {
+    let (fill, stroke, color) = match kind {
+        1 => (
+            pal.ok,
+            pal.ok,
+            if pal.light {
+                egui::Color32::WHITE
+            } else {
+                egui::Color32::from_rgb(7, 19, 12)
+            },
+        ),
+        2 => (pal.panel2, pal.danger_stroke, pal.bad),
+        3 => (pal.panel2, pal.accent_stroke, pal.ok),
+        _ => (pal.panel2, pal.border, pal.text),
+    };
+    ui.add(
+        egui::Button::new(egui::RichText::new(text).size(12.0).color(color))
+            .fill(fill)
+            .stroke(egui::Stroke::new(1.0_f32, stroke))
+            .min_size(egui::vec2(0.0, 30.0))
+            .corner_radius(6.0),
+    )
+}
+
+fn device_field(
+    ui: &mut egui::Ui,
+    pal: &Palette,
+    label: &str,
+    value: &mut String,
+    hint: &str,
+    password: bool,
+    editable: bool,
+) {
+    ui.label(egui::RichText::new(label).size(11.0).color(pal.dim));
+    ui.add_space(4.0);
+    ui.scope(|ui| {
+        ui.visuals_mut().extreme_bg_color = pal.inset;
+        ui.visuals_mut().widgets.inactive.bg_stroke = egui::Stroke::new(1.0_f32, pal.border);
+        ui.add_sized(
+            [ui.available_width(), 30.0],
+            egui::TextEdit::singleline(value)
+                .font(if editable {
+                    egui::FontId::proportional(12.0)
+                } else {
+                    egui::FontId::monospace(12.0)
+                })
+                .text_color(if editable { pal.text } else { pal.dim })
+                .margin(egui::Margin::symmetric(9, 7))
+                .hint_text(hint)
+                .password(password)
+                .interactive(editable),
+        );
+    });
+    ui.add_space(10.0);
+}
+
+fn device_password_field(ui: &mut egui::Ui, pal: &Palette, value: &mut String, visible: &mut bool) {
+    ui.label(
+        egui::RichText::new("密码（默认遮盖）")
+            .size(11.0)
+            .color(pal.dim),
+    );
+    ui.add_space(4.0);
+    ui.horizontal(|ui| {
+        let width = (ui.available_width() - 56.0).max(0.0);
+        ui.visuals_mut().extreme_bg_color = pal.inset;
+        ui.add_sized(
+            [width, 30.0],
+            egui::TextEdit::singleline(value)
+                .font(egui::FontId::proportional(12.0))
+                .margin(egui::Margin::symmetric(9, 7))
+                .password(!*visible),
+        );
+        if device_button(ui, pal, if *visible { "隐藏" } else { "显示" }, 0).clicked() {
+            *visible = !*visible;
+        }
+    });
+    ui.add_space(10.0);
+}
+
+fn device_form_row(
+    ui: &mut egui::Ui,
+    pal: &Palette,
+    first: (&str, &mut String, &str, bool, bool),
+    second: (&str, &mut String, &str, bool, bool),
+) {
+    ui.columns(2, |columns| {
+        device_field(
+            &mut columns[0],
+            pal,
+            first.0,
+            first.1,
+            first.2,
+            first.3,
+            first.4,
+        );
+        device_field(
+            &mut columns[1],
+            pal,
+            second.0,
+            second.1,
+            second.2,
+            second.3,
+            second.4,
+        );
+    });
+}
+
+fn device_tab_button(
+    ui: &mut egui::Ui,
+    pal: &Palette,
+    text: &str,
+    selected: bool,
+) -> egui::Response {
+    let response = ui.add(
+        egui::Button::new(egui::RichText::new(text).size(12.0).color(if selected {
+            pal.text
+        } else {
+            pal.dim
+        }))
+        .frame(false)
+        .min_size(egui::vec2(0.0, 32.0)),
+    );
+    if selected {
+        let rect = response.rect;
+        ui.painter().line_segment(
+            [rect.left_bottom(), rect.right_bottom()],
+            egui::Stroke::new(2.0_f32, pal.ok),
+        );
+    }
+    response
+}
+
+fn device_notice(ui: &mut egui::Ui, pal: &Palette, text: &str, warning: bool) {
+    egui::Frame::new()
+        .fill(if warning { pal.warn_fill } else { pal.panel2 })
+        .stroke(egui::Stroke::new(
+            1.0_f32,
+            if warning { pal.warn_stroke } else { pal.border },
+        ))
+        .corner_radius(6.0)
+        .inner_margin(egui::Margin::symmetric(11, 9))
+        .show(ui, |ui| {
+            ui.label(egui::RichText::new(text).size(11.0).color(if warning {
+                pal.warn
+            } else {
+                pal.dim
+            }));
+        });
+}
 
 /// 专注态悬浮按钮的图标；原型用内联 SVG，这里用 painter 画同样的形状。
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -4280,8 +4738,30 @@ fn chip(ui: &mut egui::Ui, pal: &Palette, text: &str, active: bool) {
         });
 }
 
+/// 将空列表说明与入口作为一个整体居中，避免各控件分别填满可用高度。
+fn empty_device_state(ui: &mut egui::Ui, pal: &Palette) -> (egui::Response, egui::Response) {
+    let text = "设备列表为空\n添加一台摄像机开始预览";
+    let text_height = ui.fonts(|fonts| {
+        fonts
+            .layout_no_wrap(text.to_owned(), egui::FontId::proportional(12.0), pal.faint)
+            .size()
+            .y
+    });
+    let group_height =
+        text_height + 14.0 + ui.spacing().interact_size.y + 2.0 * ui.spacing().item_spacing.y;
+    let top_space = ((ui.available_height() - group_height) / 2.0).max(0.0);
+    ui.vertical_centered(|ui| {
+        ui.add_space(top_space);
+        ui.label(egui::RichText::new(text).size(12.0).color(pal.faint));
+        ui.add_space(14.0);
+        ui.horizontal(|ui| (ui.button("添加设备"), ui.button("导入设备")))
+            .inner
+    })
+    .inner
+}
+
 /// 状态小标签（在线 / 离线 …）。
-fn tag(ui: &mut egui::Ui, text: &str, color: egui::Color32) {
+fn tag(ui: &mut egui::Ui, text: &str, color: egui::Color32) -> egui::Response {
     egui::Frame::new()
         .fill(color.gamma_multiply(0.14))
         .corner_radius(3.0_f32)
@@ -4292,8 +4772,14 @@ fn tag(ui: &mut egui::Ui, text: &str, color: egui::Color32) {
             bottom: 1,
         })
         .show(ui, |ui| {
-            ui.label(egui::RichText::new(text).size(10.0).color(color));
-        });
+            ui.horizontal(|ui| {
+                ui.spacing_mut().item_spacing.x = 5.0;
+                let (dot, _) = ui.allocate_exact_size(egui::vec2(5.0, 5.0), egui::Sense::hover());
+                ui.painter().circle_filled(dot.center(), 2.5, color);
+                ui.label(egui::RichText::new(text).size(10.0).color(color));
+            });
+        })
+        .response
 }
 
 /// 日志单元格固定列宽并左起排列；add_sized 会居中子控件，仅改 Label::halign 不够。
@@ -4695,6 +5181,455 @@ fn local_bias_minutes() -> i32 {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn device_menus_open_compact_and_receive_actions_without_selecting_card() {
+        for pal in [Palette::dark(), Palette::light()] {
+            for global in [true, false] {
+                let ctx = egui::Context::default();
+                ctx.set_visuals(crate::theme::build_visuals(&pal));
+                let screen = egui::Rect::from_min_size(egui::Pos2::ZERO, egui::vec2(900.0, 700.0));
+                let mut trigger = egui::Rect::NOTHING;
+                let mut trigger_id = egui::Id::new("menu_trigger_unset");
+                let mut entries: Vec<egui::Rect> = Vec::new();
+                let mut selected_card = false;
+                let mut selected_action = None;
+                let mut first_open = None;
+                let mut first_popup = None;
+                for frame in 0..14 {
+                    let target = if frame < 6 {
+                        trigger.center()
+                    } else if entries.is_empty() {
+                        egui::Pos2::ZERO
+                    } else if !global && frame < 10 {
+                        entries[1].center()
+                    } else {
+                        entries[entries.len() - 1].center()
+                    };
+                    let events = if matches!(frame, 2 | 3 | 7 | 8 | 11 | 12) {
+                        vec![
+                            egui::Event::PointerMoved(target),
+                            egui::Event::PointerButton {
+                                pos: target,
+                                button: egui::PointerButton::Primary,
+                                pressed: matches!(frame, 2 | 7 | 11),
+                                modifiers: egui::Modifiers::NONE,
+                            },
+                        ]
+                    } else if matches!(frame, 1 | 6 | 10) {
+                        vec![egui::Event::PointerMoved(target)]
+                    } else {
+                        Vec::new()
+                    };
+                    let output = ctx.run(
+                        egui::RawInput {
+                            screen_rect: Some(screen),
+                            events,
+                            ..Default::default()
+                        },
+                        |ctx| {
+                            egui::CentralPanel::default().show(ctx, |ui| {
+                                let mut menu_left = f32::INFINITY;
+                                let card = egui::Frame::new().show(ui, |ui| {
+                                    ui.horizontal(|ui| {
+                                        ui.add_sized([160.0, 28.0], egui::Label::new("合成设备"));
+                                        let menu = egui::menu::menu_custom_button(
+                                            ui,
+                                            egui::Button::new("").min_size(egui::vec2(22.0, 20.0)),
+                                            |ui| {
+                                                ui.set_min_width(146.0);
+                                                let labels: &[(&str, bool, bool)] = if global {
+                                                    &[
+                                                        ("导入设备…", true, false),
+                                                        ("导出设备…", true, false),
+                                                    ]
+                                                } else {
+                                                    &[
+                                                        ("播放", true, false),
+                                                        ("断开", false, false),
+                                                        ("编辑", true, false),
+                                                        ("删除", true, true),
+                                                    ]
+                                                };
+                                                let mut rects = Vec::new();
+                                                for (i, &(text, enabled, danger)) in
+                                                    labels.iter().enumerate()
+                                                {
+                                                    if !global && i == 2 {
+                                                        ui.separator();
+                                                    }
+                                                    let response = device_menu_item(
+                                                        ui, &pal, text, enabled, danger,
+                                                    );
+                                                    rects.push(response.rect);
+                                                    if response.clicked() {
+                                                        selected_action = Some(i);
+                                                    }
+                                                }
+                                                if first_open.is_none() {
+                                                    first_open = Some(rects.clone());
+                                                }
+                                                entries = rects;
+                                            },
+                                        );
+                                        trigger_id = menu.response.id;
+                                        trigger = menu.response.rect;
+                                        menu_left = trigger.left();
+                                    });
+                                });
+                                let mut hit = card.response.rect;
+                                hit.max.x = menu_left.clamp(hit.min.x, hit.max.x);
+                                if ui
+                                    .interact(hit, egui::Id::new("test_card"), egui::Sense::click())
+                                    .clicked()
+                                {
+                                    selected_card = true;
+                                }
+                            });
+                        },
+                    );
+                    if frame == 3 {
+                        first_popup = ctx.memory(|m| m.area_rect(trigger_id.with("__menu")));
+                    }
+                    if frame == 5 {
+                        let stable_popup = ctx.memory(|m| m.area_rect(trigger_id.with("__menu")));
+                        let first = first_open.as_ref().expect("菜单应展开");
+                        for row in [first, &entries] {
+                            let bounds = row
+                                .iter()
+                                .copied()
+                                .fold(egui::Rect::NOTHING, |a, b| a.union(b));
+                            assert!(
+                                bounds.width() <= 200.0 && bounds.height() <= 180.0,
+                                "菜单应紧凑：global={global} bounds={bounds:?} rows={row:?}"
+                            );
+                            assert!(
+                                row.iter().all(|r| screen.contains_rect(*r)),
+                                "所有菜单项应在可视范围内"
+                            );
+                            for pair in row.windows(2) {
+                                assert!(pair[0].bottom() <= pair[1].top(), "菜单项不能重叠");
+                            }
+                        }
+                        assert!(first_popup.is_some(), "首帧应存在弹出层");
+                        for popup in [first_popup, stable_popup].into_iter().flatten() {
+                            assert!(
+                                popup.width() <= 210.0 && popup.height() <= 190.0,
+                                "弹层本身不能撑满窗口：{popup:?}"
+                            );
+                        }
+                        assert!(stable_popup.is_some(), "稳定帧应存在弹出层");
+                        assert!(
+                            entries
+                                .iter()
+                                .all(|r| stable_popup.is_some_and(|p| p.contains_rect(*r))),
+                            "所有菜单项应位于弹层内"
+                        );
+                        let first_text = if global { "导入设备…" } else { "播放" };
+                        let text = output
+                            .shapes
+                            .iter()
+                            .find_map(|s| match &s.shape {
+                                egui::Shape::Text(t) if t.galley.job.text == first_text => Some(t),
+                                _ => None,
+                            })
+                            .expect("菜单文字应绘制");
+                        assert!(text.pos.x - entries[0].left() < 15.0, "菜单文字应左对齐");
+                    }
+                    if !global && frame == 9 {
+                        assert_eq!(selected_action, None, "禁用的断开不能响应点击");
+                    }
+                    if global && frame == 9 {
+                        break;
+                    }
+                }
+                assert_eq!(
+                    selected_action,
+                    Some(if global { 1 } else { 3 }),
+                    "菜单项应可点击"
+                );
+                assert!(!selected_card, "点击菜单不能播放设备");
+            }
+        }
+    }
+
+    #[test]
+    fn device_modal_keeps_footer_visible_with_long_content_in_small_viewport() {
+        for pal in [Palette::dark(), Palette::light()] {
+            let ctx = egui::Context::default();
+            let screen = egui::Rect::from_min_size(egui::Pos2::ZERO, egui::vec2(320.0, 300.0));
+            let mut panel = egui::Rect::NOTHING;
+            let mut button = egui::Rect::NOTHING;
+            for _ in 0..2 {
+                let _ = ctx.run(
+                    egui::RawInput {
+                        screen_rect: Some(screen),
+                        ..Default::default()
+                    },
+                    |ctx| {
+                        let modal = device_modal(ctx, "modal_layout_test", &pal, 560.0, |ui| {
+                            device_modal_header(ui, &pal, "编辑设备");
+                            egui::Frame::new()
+                                .inner_margin(egui::Margin::symmetric(18, 14))
+                                .show(ui, |ui| {
+                                    egui::ScrollArea::vertical()
+                                        .max_height(130.0)
+                                        .show(ui, |ui| {
+                                            for _ in 0..12 {
+                                                let mut value =
+                                                    "很长的合成地址和错误提示".repeat(8);
+                                                device_field(
+                                                    ui, &pal, "名称", &mut value, "", false, true,
+                                                );
+                                            }
+                                        });
+                                });
+                            ui.separator();
+                            egui::Frame::new()
+                                .inner_margin(egui::Margin::symmetric(18, 12))
+                                .show(ui, |ui| {
+                                    ui.with_layout(
+                                        egui::Layout::right_to_left(egui::Align::Center),
+                                        |ui| {
+                                            button = device_button(ui, &pal, "保存", 1).rect;
+                                            device_button(ui, &pal, "取消", 0);
+                                        },
+                                    );
+                                });
+                        });
+                        panel = modal.response.rect;
+                    },
+                );
+            }
+            assert!(screen.contains_rect(panel), "弹层应在视口内：{panel:?}");
+            assert!(
+                screen.contains_rect(button),
+                "滚动正文不能挤出页脚：{button:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn device_modal_backdrop_click_does_not_activate_underlying_action() {
+        let ctx = egui::Context::default();
+        let screen = egui::Rect::from_min_size(egui::Pos2::ZERO, egui::vec2(600.0, 400.0));
+        let mut underlying_rect = egui::Rect::NOTHING;
+        let mut underlying_clicked = false;
+        let mut backdrop_clicked = false;
+        for frame in 0..4 {
+            let pos = underlying_rect.center();
+            let events = if frame >= 2 {
+                vec![
+                    egui::Event::PointerMoved(pos),
+                    egui::Event::PointerButton {
+                        pos,
+                        button: egui::PointerButton::Primary,
+                        pressed: frame == 2,
+                        modifiers: egui::Modifiers::NONE,
+                    },
+                ]
+            } else {
+                Vec::new()
+            };
+            let _ = ctx.run(
+                egui::RawInput {
+                    screen_rect: Some(screen),
+                    events,
+                    ..Default::default()
+                },
+                |ctx| {
+                    egui::CentralPanel::default().show(ctx, |ui| {
+                        let response = ui.button("底层操作");
+                        underlying_rect = response.rect;
+                        underlying_clicked |= response.clicked();
+                    });
+                    let modal =
+                        device_modal(ctx, "modal_routing_test", &Palette::dark(), 440.0, |ui| {
+                            device_modal_header(ui, &Palette::dark(), "删除设备");
+                            ui.add_space(80.0);
+                        });
+                    backdrop_clicked |= modal.backdrop_response.clicked();
+                },
+            );
+        }
+        assert!(backdrop_clicked, "遮罩应接收取消点击");
+        assert!(!underlying_clicked, "遮罩点击不能穿透到列表操作");
+    }
+
+    #[test]
+    fn empty_device_actions_remain_visible_and_grouped_in_narrow_scroll_area() {
+        let ctx = egui::Context::default();
+        let mut bounds = egui::Rect::NOTHING;
+        let mut buttons = None;
+        let _ = ctx.run(
+            egui::RawInput {
+                screen_rect: Some(egui::Rect::from_min_size(
+                    egui::Pos2::ZERO,
+                    egui::vec2(180.0, 300.0),
+                )),
+                ..Default::default()
+            },
+            |ctx| {
+                egui::CentralPanel::default().show(ctx, |ui| {
+                    bounds = ui.available_rect_before_wrap();
+                    egui::ScrollArea::vertical().show(ui, |ui| {
+                        let (add, import) = empty_device_state(ui, &Palette::dark());
+                        buttons = Some((add.rect, import.rect));
+                    });
+                });
+            },
+        );
+        let (add, import) = buttons.expect("空态应绘制两个操作入口");
+        assert!(bounds.contains_rect(add), "添加按钮应位于可视区域：{add:?}");
+        assert!(
+            bounds.contains_rect(import),
+            "导入按钮应位于可视区域：{import:?}"
+        );
+        assert!(add.right() <= import.left(), "按钮应紧凑并排");
+        assert!(
+            (add.center().y - bounds.center().y).abs() < 60.0,
+            "按钮组应靠近可视区域中心"
+        );
+    }
+
+    #[test]
+    fn device_addresses_hide_secrets_and_keep_path_case_for_onvif() {
+        assert_eq!(
+            address_host("rtsp://user:password@Example:554/a?token=secret"),
+            Some("Example:554")
+        );
+        assert_eq!(
+            normalized_onvif("HTTP://Example:80/Custom/Service").unwrap(),
+            "http://example/Custom/Service"
+        );
+        assert_ne!(
+            normalized_onvif("http://example/Custom"),
+            normalized_onvif("http://example/custom")
+        );
+        assert!(normalized_onvif("http://example:bad").is_err());
+        assert!(normalized_onvif("https://example").is_err());
+        assert!(valid_stream("srt://example:1234?mode=caller"));
+        assert!(valid_stream("udp://example:1234"));
+        assert!(!valid_stream("rtsp:///missing"));
+    }
+
+    #[test]
+    fn form_validates_duplicates_and_preserves_existing_capabilities() {
+        let mut old = Camera::new("old", "name", "rtsp://host/live");
+        old.onvif_url = Some("http://example/onvif/device_service".into());
+        old.invert_pan = true;
+        old.capabilities.ptz = false;
+        let duplicate = DeviceForm {
+            onvif: "HTTP://EXAMPLE:80/".into(),
+            ..Default::default()
+        };
+        assert!(prepare_device(&duplicate, DeviceTab::Onvif, &[old.clone()]).is_err());
+        let edit = DeviceForm {
+            editing: Some("old".into()),
+            name: "renamed".into(),
+            onvif: "http://example".into(),
+            stream: "rtsp://host/live".into(),
+            ..Default::default()
+        };
+        let (renamed, index, changed) = prepare_device(&edit, DeviceTab::Onvif, &[old]).unwrap();
+        assert_eq!(index, Some(0));
+        assert!(!changed);
+        assert_eq!(renamed.id, "old");
+        assert!(renamed.invert_pan);
+        assert!(!renamed.capabilities.ptz);
+    }
+
+    #[test]
+    fn new_stream_devices_have_safe_nonreused_ids_and_viewer_capabilities() {
+        let form = DeviceForm {
+            stream: "rtsp://host/live".into(),
+            ..Default::default()
+        };
+        let (first, index, _) = prepare_device(&form, DeviceTab::Stream, &[]).unwrap();
+        let (second, _, _) = prepare_device(&form, DeviceTab::Stream, &[]).unwrap();
+        assert_eq!(index, None);
+        assert_ne!(first.id, second.id);
+        assert!(first
+            .id
+            .chars()
+            .all(|c| c.is_ascii_alphanumeric() || c == '-'));
+        assert!(!first.capabilities.ptz && !first.capabilities.zoom);
+        assert!(prepare_device(&form, DeviceTab::Stream, &[first]).is_err());
+    }
+
+    #[test]
+    fn adding_uses_only_current_tab_addresses() {
+        let form = DeviceForm {
+            onvif: "http://camera".into(),
+            stream: "rtsp://other/live".into(),
+            sub_stream: "rtsp://other/sub".into(),
+            ..Default::default()
+        };
+        let (onvif, _, _) = prepare_device(&form, DeviceTab::Onvif, &[]).unwrap();
+        assert_eq!(onvif.onvif_url.as_deref(), Some("http://camera"));
+        assert!(onvif.stream_url.is_empty() && onvif.sub_stream_url.is_none());
+        let (stream, _, _) = prepare_device(&form, DeviceTab::Stream, &[]).unwrap();
+        assert!(stream.onvif_url.is_none());
+        assert_eq!(stream.stream_url, "rtsp://other/live");
+        assert_eq!(stream.sub_stream_url.as_deref(), Some("rtsp://other/sub"));
+    }
+
+    #[test]
+    fn discovered_stream_uses_new_credentials_without_replacing_manual_address() {
+        let mut cam = Camera::new("a", "a", "");
+        cam.onvif_url = Some("http://camera".into());
+        cam.username = Some("old".into());
+        cam.password = Some("first".into());
+        remember_stream_uri(&mut cam, "rtsp://camera/live");
+        assert_eq!(cam.stream_url, "rtsp://camera/live");
+        cam.username = Some("new".into());
+        cam.password = Some("second".into());
+        assert_eq!(cam.resolved_url(true), "rtsp://new:second@camera/live");
+        let form = DeviceForm {
+            editing: Some("a".into()),
+            onvif: "http://camera".into(),
+            stream: "rtsp://camera/manual".into(),
+            user: "another".into(),
+            ..Default::default()
+        };
+        let (edited, _, _) = prepare_device(&form, DeviceTab::Onvif, &[cam]).unwrap();
+        assert_eq!(edited.stream_url, "rtsp://camera/manual");
+    }
+
+    #[test]
+    fn selection_is_stable_on_click_and_removal() {
+        assert!(!should_play(1, 1, &Conn::Connecting));
+        assert!(!should_play(
+            1,
+            1,
+            &Conn::Live {
+                width: 1,
+                height: 1,
+                codec: String::new()
+            }
+        ));
+        assert!(should_play(1, 1, &Conn::Idle));
+        assert!(should_play(1, 1, &Conn::Failed("error".into())));
+        assert!(should_play(1, 0, &Conn::Connecting));
+        assert_eq!(selection_after_delete(2, 0), 1);
+        assert_eq!(selection_after_delete(1, 1), NO_DEVICE);
+        assert_eq!(selection_after_delete(NO_DEVICE, 0), NO_DEVICE);
+    }
+
+    #[test]
+    fn stale_config_success_cannot_clear_newer_failure_and_retry_can() {
+        let mut error = None;
+        assert!(apply_config_receipt(
+            2,
+            2,
+            Err("disk full".into()),
+            &mut error
+        ));
+        assert!(!apply_config_receipt(2, 1, Ok(()), &mut error));
+        assert_eq!(error.as_deref(), Some("disk full"));
+        assert!(!apply_config_receipt(3, 3, Ok(()), &mut error));
+        assert!(error.is_none());
+    }
 
     #[test]
     fn short_log_message_starts_at_left_edge_of_its_column() {

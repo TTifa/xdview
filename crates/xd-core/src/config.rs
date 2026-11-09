@@ -768,4 +768,14 @@ mod tests {
         assert!(parse_cameras("[settings]\nmax_width = 640\n").is_err());
         assert!(parse_cameras("garbage").is_err());
     }
+
+    #[test]
+    fn empty_device_configuration_roundtrips_but_empty_import_is_rejected() {
+        let mut config = parse(EXAMPLE).unwrap();
+        config.cameras.clear();
+        let saved = app_config_to_toml(&config);
+        let reloaded = parse(&saved).unwrap();
+        assert!(reloaded.cameras.is_empty());
+        assert!(parse_cameras(&saved).is_err());
+    }
 }

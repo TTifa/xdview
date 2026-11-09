@@ -1,0 +1,2170 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>XDView · 智能摄像机客户端 — 交互原型 v2（设备列表重设计）</title>
+<style>
+  :root {
+    --bg: #090A0C;
+    --panel: #101318;
+    --panel2: #151A22;
+    --inset: #0C0F14;
+    --border: #1E2430;
+    --border-strong: #2A3242;
+    --text: #E6E9EF;
+    --dim: #8A92A3;
+    --faint: #565E6E;
+    --ok: #56C88C;
+    --warn: #E8B24A;
+    --bad: #E26060;
+    --info: #5CA8E8;
+    --accent: #56C88C;
+    --radius: 8px;
+    --mono: "Cascadia Mono", Consolas, "JetBrains Mono", ui-monospace, monospace;
+  }
+  /* ============ 日间模式（浅色皮肤） ============ */
+  body.light {
+    --bg: #F2F4F7;
+    --panel: #FFFFFF;
+    --panel2: #F4F6F9;
+    --inset: #EDF0F4;
+    --border: #DCE2EA;
+    --border-strong: #C3CCD8;
+    --text: #1C2534;
+    --dim: #5D6776;
+    --faint: #9AA3B2;
+    --ok: #1E9E63;
+    --warn: #B47A16;
+    --bad: #D24A4A;
+    --info: #2E7DBD;
+    --accent: #1E9E63;
+  }
+  body.light .stage-wrap { background: radial-gradient(ellipse at 50% 40%, #FAFBFD 0%, var(--bg) 75%); }
+  body.light .device-card.active { background: #EDF7F1; }
+  body.light .btn:hover:not(:disabled) { background: #E9EDF3; }
+  body.light .toast { background: #FFFFFF; box-shadow: 0 8px 24px rgba(30, 40, 60, 0.16); }
+  body.light .modal { box-shadow: 0 24px 60px rgba(30, 40, 60, 0.22); }
+  body.light .log-line .msg { color: #414B5C; }
+  body.light ::-webkit-scrollbar-thumb { background: #C9D1DC; border: 2px solid var(--bg); }
+  /* 浅色下把硬编码的深色绿统一替换为可读的深绿 */
+  body.light .btn-add { color: var(--accent); border-color: rgba(30, 158, 99, 0.4); }
+  body.light .btn-add:hover { background: rgba(30, 158, 99, 0.1); }
+  body.light .btn.primary { color: #fff; }
+  body.light .btn.primary:hover { background: var(--accent); }
+  body.light .btn.primary:hover:not(:disabled) { background: var(--accent); }
+  body.light .btn.accent { color: var(--accent); border-color: rgba(30, 158, 99, 0.4); }
+  body.light .btn.accent:hover:not(:disabled) { background: rgba(30, 158, 99, 0.1); }
+  body.light .seg button.on { color: var(--accent); background: rgba(30, 158, 99, 0.12); }
+  body.light .toggle.on .sw { background: rgba(30, 158, 99, 0.35); }
+  body.light .toggle.on .sw::after { background: var(--accent); }
+  body.light .switch.on { background: rgba(30, 158, 99, 0.35); }
+  body.light .switch.on::after { background: var(--accent); }
+  body.light .found-item.added { border-color: rgba(30, 158, 99, 0.45); }
+  body.light .dpad button.holding { background: rgba(30, 158, 99, 0.16); color: var(--accent); border-color: var(--accent); }
+  body.light .dot.on { box-shadow: 0 0 5px rgba(30, 158, 99, 0.55); }
+  body.light .stat-cell .v.accent { color: var(--accent); }
+  /* 主题切换按钮 */
+  .theme-btn {
+    width: 30px; height: 30px; flex: none;
+    display: flex; align-items: center; justify-content: center;
+    border: 1px solid var(--border); border-radius: 6px;
+    background: var(--panel2); color: var(--dim);
+    transition: color 0.15s, border-color 0.15s;
+  }
+  .theme-btn:hover { color: var(--text); border-color: var(--border-strong); }
+  .theme-btn svg { width: 15px; height: 15px; }
+  .theme-btn .icon-sun { display: none; }
+  body.light .theme-btn .icon-sun { display: block; }
+  body.light .theme-btn .icon-moon { display: none; }
+  .theme-btn.wide { width: auto; padding: 0 10px; gap: 6px; font-size: 12px; }
+
+  /* ============ 专注模式 ============ */
+  body.focus .topbar,
+  body.focus .sidebar,
+  body.focus .right,
+  body.focus .video-bar,
+  body.focus .log-panel { display: none; }
+  body.focus .main { grid-template-columns: 1fr; }
+  body.focus .stage-wrap { padding: 0; background: #05060A; }
+  body.focus .stage {
+    max-width: calc(100vh * 1.7778);
+    border: none;
+    border-radius: 0;
+  }
+  body.focus .ov-tr { top: 56px; }
+  .focus-exit {
+    position: absolute; top: 14px; right: 14px; z-index: 20;
+    display: none; align-items: center; gap: 7px;
+    background: rgba(0, 0, 0, 0.45);
+    border: 1px solid rgba(255, 255, 255, 0.28);
+    border-radius: 6px;
+    color: #fff; font-size: 12px;
+    padding: 6px 12px;
+    backdrop-filter: blur(4px);
+    transition: opacity 0.4s, background 0.15s;
+  }
+  body.focus .focus-exit { display: flex; }
+  .focus-exit:hover { background: rgba(0, 0, 0, 0.7); }
+  .focus-exit.idle { opacity: 0; pointer-events: none; }
+  .focus-exit svg { width: 13px; height: 13px; }
+  * { margin: 0; padding: 0; box-sizing: border-box; }
+  html, body { height: 100%; }
+  body {
+    background: var(--bg);
+    color: var(--text);
+    font-family: "Segoe UI", "Microsoft YaHei UI", "Microsoft YaHei", "PingFang SC", sans-serif;
+    font-size: 13px;
+    overflow: hidden;
+    display: flex;
+    flex-direction: column;
+  }
+  button { font-family: inherit; color: inherit; background: none; border: none; cursor: pointer; }
+  button:disabled { cursor: not-allowed; opacity: 0.4; }
+
+  /* ============ 顶栏 ============ */
+  .topbar {
+    height: 46px;
+    flex: none;
+    display: flex;
+    align-items: center;
+    gap: 14px;
+    padding: 0 16px;
+    background: var(--panel);
+    border-bottom: 1px solid var(--border);
+  }
+  .logo { display: flex; align-items: baseline; gap: 8px; }
+  .logo b { font-size: 15px; letter-spacing: 0.5px; }
+  .logo span { font-size: 11px; color: var(--faint); }
+  .proto-chips { display: flex; gap: 6px; margin-left: 4px; }
+  .chip {
+    font: 10px var(--mono);
+    color: var(--dim);
+    border: 1px solid var(--border);
+    border-radius: 4px;
+    padding: 2px 7px;
+    letter-spacing: 0.4px;
+  }
+  .topbar .spacer { flex: 1; }
+  .global-state { display: flex; align-items: center; gap: 7px; font-size: 12px; color: var(--dim); }
+  .dot { width: 7px; height: 7px; border-radius: 50%; background: var(--faint); }
+  .dot.on { background: var(--ok); box-shadow: 0 0 6px rgba(86,200,140,0.7); }
+  #clock { font: 12px var(--mono); color: var(--dim); letter-spacing: 0.5px; }
+
+  /* ============ 主布局 ============ */
+  .main {
+    flex: 1;
+    display: grid;
+    grid-template-columns: 246px 1fr 314px;
+    min-height: 0;
+  }
+
+  /* ============ 左侧：设备列表 ============ */
+  .sidebar {
+    background: var(--panel);
+    border-right: 1px solid var(--border);
+    display: flex;
+    flex-direction: column;
+    min-height: 0;
+  }
+  .side-head {
+    flex: none;
+    display: flex;
+    align-items: center;
+    justify-content: space-between;
+    padding: 12px 12px 10px 14px;
+  }
+  .side-head h2 { font-size: 12px; font-weight: 600; color: var(--dim); letter-spacing: 1px; }
+  .side-head h2 b { color: var(--text); font-family: var(--mono); }
+  .side-actions { display: flex; align-items: center; gap: 6px; }
+  .btn-add {
+    display: flex; align-items: center; gap: 5px;
+    font-size: 12px;
+    color: var(--accent);
+    border: 1px solid rgba(86,200,140,0.35);
+    border-radius: 6px;
+    padding: 4px 10px;
+    transition: background 0.15s;
+  }
+  .btn-add:hover { background: rgba(86,200,140,0.1); }
+  .icon-btn {
+    width: 26px; height: 26px; flex: none;
+    display: flex; align-items: center; justify-content: center;
+    border: 1px solid var(--border); border-radius: 6px;
+    color: var(--dim); font-size: 15px; line-height: 1;
+    transition: color 0.15s, border-color 0.15s;
+  }
+  .icon-btn:hover { color: var(--text); border-color: var(--border-strong); }
+
+  .device-list { flex: 1; overflow-y: auto; padding: 2px 10px 10px; }
+  .device-card {
+    width: 100%;
+    text-align: left;
+    border: 1px solid var(--border);
+    border-radius: var(--radius);
+    background: var(--panel2);
+    padding: 9px 11px;
+    margin-bottom: 7px;
+    transition: border-color 0.15s, background 0.15s;
+    position: relative;
+    cursor: pointer;
+  }
+  .device-card:hover { border-color: var(--border-strong); }
+  .device-card.active { border-color: rgba(86,200,140,0.55); background: #131B18; }
+  body.light .device-card.active { background: #EDF7F1; }
+  .device-card.active.is-failed { border-color: rgba(226,96,96,0.55); background: #1B1315; }
+  body.light .device-card.active.is-failed { background: #FBEEEE; }
+  .device-card .row1 { display: flex; align-items: center; gap: 7px; min-width: 0; }
+  .device-card .dname {
+    font-size: 13px; font-weight: 600; flex: 1; min-width: 0;
+    white-space: nowrap; overflow: hidden; text-overflow: ellipsis;
+  }
+  .device-card .dmenu {
+    flex: none;
+    width: 22px; height: 20px;
+    display: flex; align-items: center; justify-content: center;
+    color: var(--faint); font-size: 14px; line-height: 1;
+    border-radius: 4px;
+    visibility: hidden;
+    transition: color 0.15s, background 0.15s;
+  }
+  .device-card:hover .dmenu, .device-card.menu-open .dmenu { visibility: visible; }
+  .device-card .dmenu:hover { color: var(--text); background: var(--inset); }
+  .device-card .row2 {
+    display: flex; align-items: center; margin-top: 5px;
+    font: 10px var(--mono); color: var(--dim);
+  }
+  .device-card .dhost { white-space: nowrap; overflow: hidden; text-overflow: ellipsis; letter-spacing: 0.3px; }
+
+  /* 连接状态标签（7 态） */
+  .st {
+    flex: none;
+    display: inline-flex; align-items: center; gap: 5px;
+    font-size: 10px; padding: 1.5px 7px; border-radius: 3px;
+  }
+  .st i { width: 5px; height: 5px; border-radius: 50%; background: currentColor; }
+  .st.pulse i { animation: stpulse 1.1s ease-in-out infinite; }
+  @keyframes stpulse { 50% { opacity: 0.2; } }
+  .st.idle { color: var(--faint); background: rgba(120,128,144,0.12); }
+  .st.connecting, .st.waiting { color: var(--info); background: rgba(92,168,232,0.13); }
+  .st.live { color: var(--ok); background: rgba(86,200,140,0.13); }
+  .st.paused, .st.reconnecting { color: var(--warn); background: rgba(232,178,74,0.13); }
+  .st.failed { color: var(--bad); background: rgba(226,96,96,0.13); }
+  body.light .st.idle { background: rgba(120,128,144,0.14); }
+
+  /* 空列表 */
+  .empty-state {
+    flex: 1;
+    display: none;
+    flex-direction: column; align-items: center; justify-content: center;
+    gap: 14px; padding: 20px;
+    color: var(--faint); font-size: 12px; line-height: 1.8; text-align: center;
+  }
+  .empty-state.show { display: flex; }
+  .empty-state .btns { display: flex; gap: 8px; }
+  @keyframes spin { to { transform: rotate(360deg); } }
+
+  /* ============ 中央：视频 + 日志 ============ */
+  .center { display: flex; flex-direction: column; min-width: 0; min-height: 0; }
+  .stage-wrap {
+    flex: 1;
+    min-height: 0;
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    padding: 18px;
+    background:
+      radial-gradient(ellipse at 50% 40%, #0D1015 0%, var(--bg) 75%);
+  }
+  .stage {
+    position: relative;
+    aspect-ratio: 16 / 9;
+    width: 100%;
+    max-width: calc((100vh - 320px) * 1.7778);
+    max-height: 100%;
+    background: #05060A;
+    border: 1px solid var(--border);
+    border-radius: 6px;
+    overflow: hidden;
+  }
+  .scene-viewport { position: absolute; inset: 0; overflow: hidden; }
+  .scene {
+    position: absolute;
+    left: 50%; top: 50%;
+    width: 1600px; height: 900px;
+    transform: translate(-50%, -50%);
+    transition: transform 0.12s linear;
+    will-change: transform;
+  }
+  .scene.animated { transition: transform 0.7s cubic-bezier(0.25, 0.8, 0.3, 1); }
+  .vignette {
+    position: absolute; inset: 0; pointer-events: none;
+    background: radial-gradient(ellipse at center, transparent 58%, rgba(0,0,0,0.42) 100%);
+  }
+  .scanlines {
+    position: absolute; inset: 0; pointer-events: none; opacity: 0.05;
+    background: repeating-linear-gradient(0deg, transparent 0 3px, #fff 3px 4px);
+  }
+  .flash {
+    position: absolute; inset: 0; background: #fff; opacity: 0;
+    pointer-events: none;
+  }
+  .flash.go { animation: flashout 0.45s ease-out; }
+  @keyframes flashout { 0% { opacity: 0.9; } 100% { opacity: 0; } }
+
+  /* 视频叠层 */
+  .ov { position: absolute; z-index: 5; }
+  .ov-tl { top: 12px; left: 14px; display: flex; align-items: center; gap: 10px; }
+  .ov-cam-name { font-size: 14px; font-weight: 600; text-shadow: 0 1px 4px rgba(0,0,0,0.9); }
+  .stream-badge {
+    font: 10px var(--mono);
+    padding: 2px 8px; border-radius: 4px;
+    border: 1px solid rgba(255,255,255,0.28);
+    color: rgba(255,255,255,0.85);
+    background: rgba(0,0,0,0.35);
+    letter-spacing: 0.5px;
+  }
+  .stream-badge.clickable { cursor: pointer; transition: background 0.15s; }
+  .stream-badge.clickable:hover { background: rgba(0,0,0,0.6); }
+  .stream-badge.current { border-color: var(--accent); color: var(--accent); background: rgba(86,200,140,0.12); }
+  .ov-tr { top: 12px; right: 14px; display: flex; align-items: center; gap: 10px; }
+  .rec-badge {
+    display: none; align-items: center; gap: 6px;
+    font: 11px var(--mono); color: #fff;
+    background: rgba(226,96,96,0.85);
+    padding: 3px 9px; border-radius: 4px; letter-spacing: 1px;
+  }
+  .rec-badge.on { display: flex; }
+  .rec-badge i { width: 8px; height: 8px; border-radius: 50%; background: #fff; animation: blink 1s step-end infinite; }
+  @keyframes blink { 50% { opacity: 0.15; } }
+  .ov-bl { bottom: 12px; left: 14px; font: 11px var(--mono); color: rgba(255,255,255,0.72); text-shadow: 0 1px 3px rgba(0,0,0,0.9); }
+  .ov-br { bottom: 12px; right: 14px; font: 11px var(--mono); color: rgba(255,255,255,0.55); text-shadow: 0 1px 3px rgba(0,0,0,0.9); }
+
+  /* 连接态遮罩 */
+  .conn-mask {
+    position: absolute; inset: 0; z-index: 8;
+    display: flex; flex-direction: column; align-items: center; justify-content: center; gap: 14px;
+    background: rgba(5,6,10,0.82);
+    backdrop-filter: blur(2px);
+  }
+  .conn-mask.hidden { display: none; }
+  .conn-mask .big { font-size: 14px; color: var(--dim); }
+  .conn-mask .detail { font: 11px var(--mono); color: var(--faint); max-width: 420px; text-align: center; line-height: 1.7; }
+  .conn-mask .detail.bad { color: var(--bad); }
+  .spinner {
+    width: 34px; height: 34px; border-radius: 50%;
+    border: 3px solid var(--border-strong); border-top-color: var(--accent);
+    animation: spin 0.9s linear infinite;
+  }
+  .conn-mask .icon-big { font-size: 34px; color: var(--faint); }
+
+  /* 视频下操作条 */
+  .video-bar {
+    flex: none;
+    height: 44px;
+    display: flex; align-items: center; gap: 10px;
+    padding: 0 18px;
+    border-top: 1px solid var(--border);
+    background: var(--panel);
+  }
+  .conn-text { font-size: 12px; color: var(--dim); min-width: 180px; }
+  .conn-text b { color: var(--ok); font-weight: 600; }
+  .video-bar .spacer { flex: 1; }
+  .seg { display: flex; border: 1px solid var(--border); border-radius: 6px; overflow: hidden; }
+  .seg button {
+    font-size: 11px; padding: 5px 12px; color: var(--dim);
+    background: var(--panel2);
+  }
+  .seg button + button { border-left: 1px solid var(--border); }
+  .seg button.on { color: var(--accent); background: rgba(86,200,140,0.12); font-weight: 600; }
+  .btn {
+    font-size: 12px; padding: 6px 14px;
+    border: 1px solid var(--border); border-radius: 6px;
+    background: var(--panel2); color: var(--text);
+    transition: border-color 0.15s, background 0.15s;
+  }
+  .btn:hover:not(:disabled) { border-color: var(--border-strong); background: #1A202B; }
+  .btn.danger { color: var(--bad); border-color: rgba(226,96,96,0.4); }
+  .btn.danger:hover:not(:disabled) { background: rgba(226,96,96,0.1); }
+
+  /* 底部日志 */
+  .log-panel {
+    flex: none;
+    height: 168px;
+    display: flex; flex-direction: column;
+    border-top: 1px solid var(--border);
+    background: var(--inset);
+  }
+  .log-head {
+    flex: none;
+    display: flex; align-items: center; gap: 10px;
+    padding: 7px 16px;
+    border-bottom: 1px solid var(--border);
+  }
+  .log-head h3 { font-size: 11px; font-weight: 600; color: var(--dim); letter-spacing: 1px; }
+  .log-head .spacer { flex: 1; }
+  .log-head .mini { font-size: 11px; color: var(--faint); padding: 2px 8px; border-radius: 4px; }
+  .log-head .mini:hover { color: var(--text); background: var(--panel2); }
+  .log-body {
+    flex: 1; overflow-y: auto;
+    padding: 8px 16px;
+    font: 11px/1.9 var(--mono);
+  }
+  .log-line { display: flex; gap: 12px; white-space: nowrap; }
+  .log-line .t { color: var(--faint); flex: none; }
+  .log-line .lv { flex: none; width: 44px; }
+  .log-line .lv.INFO { color: var(--info); }
+  .log-line .lv.OK { color: var(--ok); }
+  .log-line .lv.WARN { color: var(--warn); }
+  .log-line .lv.ERR { color: var(--bad); }
+  .log-line .msg { color: #B7BECB; overflow: hidden; text-overflow: ellipsis; }
+
+  /* ============ 右侧面板 ============ */
+  .right {
+    background: var(--panel);
+    border-left: 1px solid var(--border);
+    overflow-y: auto;
+    display: flex; flex-direction: column;
+  }
+  .sect { border-bottom: 1px solid var(--border); padding: 13px 16px 15px; }
+  .sect h3 {
+    font-size: 11px; font-weight: 600; color: var(--dim);
+    letter-spacing: 1.5px; margin-bottom: 11px;
+    display: flex; align-items: center; gap: 8px;
+  }
+  .sect h3 .hint { margin-left: auto; font: 10px var(--mono); color: var(--faint); letter-spacing: 0; }
+  .sect.disabled { opacity: 0.45; pointer-events: none; }
+
+  /* 统计 */
+  .stats-grid { display: grid; grid-template-columns: 1fr 1fr; gap: 8px; }
+  .stat-cell { background: var(--panel2); border: 1px solid var(--border); border-radius: 6px; padding: 8px 10px; }
+  .stat-cell .k { font-size: 10px; color: var(--faint); margin-bottom: 3px; }
+  .stat-cell .v { font: 15px var(--mono); color: var(--text); }
+  .stat-cell .v small { font-size: 10px; color: var(--dim); margin-left: 2px; }
+  .stat-cell .v.accent { color: var(--accent); }
+  .stat-row-full { grid-column: 1 / -1; display: flex; justify-content: space-between; font: 10px var(--mono); color: var(--faint); padding: 0 2px; }
+
+  /* 云台 */
+  .ptz-layout { display: flex; gap: 14px; align-items: flex-start; }
+  .dpad {
+    flex: none;
+    display: grid;
+    grid-template-columns: repeat(3, 40px);
+    grid-template-rows: repeat(3, 40px);
+    gap: 4px;
+  }
+  .dpad button {
+    background: var(--panel2);
+    border: 1px solid var(--border);
+    border-radius: 6px;
+    display: flex; align-items: center; justify-content: center;
+    color: var(--dim);
+    transition: background 0.1s, color 0.1s;
+    user-select: none;
+    touch-action: none;
+  }
+  .dpad button:hover { color: var(--text); border-color: var(--border-strong); }
+  .dpad button.holding { background: rgba(86,200,140,0.18); color: var(--accent); border-color: var(--accent); }
+  .dpad button svg { width: 15px; height: 15px; }
+  .dpad .center-btn { border-radius: 50%; font-size: 9px; letter-spacing: 1px; }
+  .ptz-side { flex: 1; display: flex; flex-direction: column; gap: 9px; }
+  .ptz-side .lbl { font-size: 10px; color: var(--faint); margin-bottom: -4px; }
+  .zoom-row { display: flex; align-items: center; gap: 6px; }
+  .zoom-row button {
+    width: 28px; height: 28px; flex: none;
+    background: var(--panel2); border: 1px solid var(--border); border-radius: 6px;
+    font: 15px var(--mono); color: var(--dim);
+  }
+  .zoom-row button:hover { color: var(--text); }
+  .zoom-track { flex: 1; height: 4px; background: var(--border); border-radius: 2px; position: relative; }
+  .zoom-fill { position: absolute; left: 0; top: 0; bottom: 0; background: var(--accent); border-radius: 2px; width: 0%; transition: width 0.15s; }
+  select {
+    width: 100%;
+    background: var(--panel2); color: var(--text);
+    border: 1px solid var(--border); border-radius: 6px;
+    font: 12px inherit; padding: 5px 8px;
+    outline: none;
+  }
+  .invert-row { display: flex; gap: 8px; }
+  .toggle {
+    flex: 1; display: flex; align-items: center; gap: 7px;
+    font-size: 11px; color: var(--dim);
+    background: var(--panel2); border: 1px solid var(--border); border-radius: 6px;
+    padding: 6px 9px; cursor: pointer; user-select: none;
+  }
+  .toggle .sw { width: 26px; height: 14px; border-radius: 7px; background: var(--border-strong); position: relative; flex: none; transition: background 0.15s; }
+  .toggle .sw::after {
+    content: ""; position: absolute; top: 2px; left: 2px;
+    width: 10px; height: 10px; border-radius: 50%; background: var(--dim);
+    transition: transform 0.15s, background 0.15s;
+  }
+  .toggle.on .sw { background: rgba(86,200,140,0.4); }
+  .toggle.on .sw::after { transform: translateX(12px); background: var(--accent); }
+
+  /* 预置位 */
+  .preset-grid { display: grid; grid-template-columns: 1fr 1fr; gap: 6px; }
+  .preset-btn {
+    font-size: 11px; text-align: left;
+    background: var(--panel2); border: 1px solid var(--border); border-radius: 6px;
+    padding: 7px 9px; color: var(--dim);
+    display: flex; align-items: center; gap: 7px;
+    transition: color 0.15s, border-color 0.15s;
+  }
+  .preset-btn:hover:not(:disabled) { color: var(--text); border-color: var(--border-strong); }
+  .preset-btn .no { font: 9px var(--mono); color: var(--faint); border: 1px solid var(--border); border-radius: 3px; padding: 0 4px; }
+  .preset-btn.empty { opacity: 0.35; pointer-events: none; }
+  .preset-note { font-size: 10px; color: var(--faint); margin-top: 8px; line-height: 1.6; }
+
+  /* 采集 */
+  .capture-row { display: flex; gap: 8px; }
+  .cap-btn {
+    flex: 1;
+    display: flex; flex-direction: column; align-items: center; gap: 6px;
+    background: var(--panel2); border: 1px solid var(--border); border-radius: 8px;
+    padding: 12px 8px 10px;
+    color: var(--dim); font-size: 11px;
+    transition: border-color 0.15s, color 0.15s, background 0.15s;
+  }
+  .cap-btn svg { width: 20px; height: 20px; }
+  .cap-btn:hover:not(:disabled) { color: var(--text); border-color: var(--border-strong); }
+  .cap-btn.rec-on { color: var(--bad); border-color: rgba(226,96,96,0.55); background: rgba(226,96,96,0.08); }
+  .cap-btn small { font: 9px var(--mono); color: var(--faint); }
+
+  /* 滚动缓存 */
+  .cache-head { display: flex; align-items: center; justify-content: space-between; margin-bottom: 10px; }
+  .cache-head .t { font-size: 12px; color: var(--text); }
+  .cache-head .s { font-size: 10px; color: var(--faint); font-family: var(--mono); }
+  .switch { width: 34px; height: 18px; border-radius: 9px; background: var(--border-strong); position: relative; cursor: pointer; transition: background 0.15s; flex: none; }
+  .switch::after {
+    content: ""; position: absolute; top: 2px; left: 2px;
+    width: 14px; height: 14px; border-radius: 50%; background: var(--dim);
+    transition: transform 0.15s, background 0.15s;
+  }
+  .switch.on { background: rgba(86,200,140,0.4); }
+  .switch.on::after { transform: translateX(16px); background: var(--accent); }
+  .cache-body { display: flex; flex-direction: column; gap: 10px; }
+  .cache-body.off { opacity: 0.4; pointer-events: none; }
+  .cache-cfg { display: flex; gap: 8px; }
+  .cache-cfg .field { flex: 1; }
+  .cache-cfg .field label { display: block; font-size: 10px; color: var(--faint); margin-bottom: 4px; }
+  .export-progress { display: none; flex-direction: column; gap: 5px; }
+  .export-progress.show { display: flex; }
+  .export-progress .bar { height: 5px; background: var(--border); border-radius: 3px; overflow: hidden; }
+  .export-progress .fill { height: 100%; width: 0%; background: var(--accent); transition: width 0.2s linear; }
+  .export-progress .txt { font: 10px var(--mono); color: var(--dim); display: flex; justify-content: space-between; }
+  .btn.full { width: 100%; padding: 8px; }
+  .btn.accent { color: var(--accent); border-color: rgba(86,200,140,0.4); }
+  .btn.accent:hover:not(:disabled) { background: rgba(86,200,140,0.1); }
+
+  /* ============ 添加 / 编辑 / 删除弹层 ============ */
+  .modal-mask {
+    position: fixed; inset: 0; z-index: 50;
+    background: rgba(4,5,8,0.7);
+    display: none; align-items: center; justify-content: center;
+  }
+  .modal-mask.show { display: flex; }
+  .modal {
+    width: 520px; max-width: 92vw;
+    background: var(--panel);
+    border: 1px solid var(--border-strong);
+    border-radius: 10px;
+    box-shadow: 0 24px 60px rgba(0,0,0,0.6);
+    overflow: hidden;
+  }
+  .modal-head {
+    display: flex; align-items: center; gap: 10px;
+    padding: 14px 18px; border-bottom: 1px solid var(--border);
+  }
+  .modal-head h3 { font-size: 14px; font-weight: 600; flex: 1; }
+  .modal-head .x { color: var(--faint); font-size: 16px; padding: 2px 8px; border-radius: 4px; }
+  .modal-head .x:hover { color: var(--text); background: var(--panel2); }
+  .modal-body { padding: 14px 18px 8px; min-height: 120px; }
+  .modal p.lead { font-size: 13px; line-height: 1.7; margin-bottom: 6px; }
+
+  /* 页签 */
+  .tabs { display: flex; gap: 2px; padding: 10px 18px 0; border-bottom: 1px solid var(--border); }
+  .tabs .tab {
+    font-size: 12px; padding: 7px 12px; color: var(--dim);
+    border-bottom: 2px solid transparent; margin-bottom: -1px;
+    transition: color 0.15s;
+  }
+  .tabs .tab:hover { color: var(--text); }
+  .tabs .tab.on { color: var(--text); border-bottom-color: var(--accent); font-weight: 600; }
+  .tabpane { display: none; padding-top: 6px; }
+  .tabpane.on { display: block; }
+  .pane-note { font-size: 11px; color: var(--faint); line-height: 1.7; margin-top: 4px; }
+
+  /* 表单 */
+  .field { margin-bottom: 10px; min-width: 0; }
+  .field label { display: block; font-size: 11px; color: var(--dim); margin-bottom: 4px; }
+  .field label .opt { color: var(--faint); font-size: 10px; font-weight: 400; }
+  .field input {
+    width: 100%;
+    background: var(--inset); color: var(--text);
+    border: 1px solid var(--border); border-radius: 6px;
+    font-size: 12px; font-family: inherit;
+    padding: 7px 9px; outline: none;
+    transition: border-color 0.15s;
+  }
+  .field input:focus { border-color: var(--border-strong); }
+  .field input.ro { color: var(--dim); font-family: var(--mono); }
+  .field input::placeholder { color: var(--faint); }
+  .field.err input { border-color: var(--bad); }
+  .field .ferr { display: none; font-size: 10px; color: var(--bad); margin-top: 3px; }
+  .field.err .ferr { display: block; }
+  .field-row { display: flex; gap: 8px; }
+  .field-row .field { flex: 1; }
+  .pw-wrap { display: flex; gap: 6px; }
+  .pw-wrap input { flex: 1; min-width: 0; }
+  .pw-wrap .btn { flex: none; padding: 6px 10px; font-size: 11px; }
+
+  .modal-foot-btns {
+    display: flex; align-items: center; gap: 8px;
+    padding: 12px 18px 16px;
+    border-top: 1px solid var(--border);
+  }
+  .modal-foot-btns .spacer { flex: 1; }
+  .form-msg { font-size: 11px; color: var(--bad); min-height: 14px; }
+  .btn.primary { background: var(--accent); border-color: var(--accent); color: #07130C; font-weight: 600; }
+  .btn.primary:hover:not(:disabled) { background: var(--accent); filter: brightness(1.1); }
+
+  /* 删除确认 */
+  .modal.small { width: 440px; }
+  .del-note { font-size: 12px; color: var(--dim); line-height: 1.7; }
+  .del-impact {
+    display: none;
+    margin-top: 10px; padding: 9px 11px;
+    border: 1px solid rgba(232,178,74,0.4);
+    background: rgba(232,178,74,0.08);
+    border-radius: 6px;
+    font-size: 11px; color: var(--warn); line-height: 1.9;
+  }
+  .del-impact.show { display: block; }
+
+  /* 发现结果 */
+  .discover-top { display: flex; align-items: center; justify-content: space-between; gap: 10px; margin-bottom: 10px; }
+  .discover-top .disc-hint { font-size: 11px; color: var(--faint); }
+  .scan-progress { display: flex; align-items: center; gap: 12px; padding: 26px 4px; color: var(--dim); font-size: 12px; }
+  .found-item {
+    display: flex; align-items: center; gap: 12px;
+    border: 1px solid var(--border); border-radius: 8px;
+    background: var(--panel2);
+    padding: 11px 13px; margin-bottom: 8px;
+  }
+  .found-item .fi-main { flex: 1; min-width: 0; }
+  .found-item .fi-name { font-size: 13px; font-weight: 600; }
+  .found-item .fi-meta { font: 10px var(--mono); color: var(--dim); margin-top: 3px; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+  .found-item .btn { flex: none; padding: 5px 14px; font-size: 11px; }
+  .found-item.added { border-color: rgba(86,200,140,0.4); }
+  .found-item .added-tag { font-size: 11px; color: var(--accent); flex: none; }
+
+  /* 浮动菜单（设备 ⋯ / 全局更多） */
+  .ctx-menu {
+    position: fixed; z-index: 70; min-width: 156px;
+    background: var(--panel);
+    border: 1px solid var(--border-strong); border-radius: 8px;
+    box-shadow: 0 12px 32px rgba(0,0,0,0.5);
+    padding: 5px;
+    display: none;
+  }
+  .ctx-menu.show { display: block; }
+  .ctx-menu button {
+    display: block; width: 100%; text-align: left;
+    font-size: 12px; padding: 7px 10px; border-radius: 5px;
+    color: var(--text);
+    transition: background 0.12s;
+  }
+  .ctx-menu button:hover:not(:disabled) { background: var(--panel2); }
+  .ctx-menu button:disabled { color: var(--faint); }
+  .ctx-menu hr { border: none; border-top: 1px solid var(--border); margin: 4px 6px; }
+  .ctx-menu button.danger { color: var(--bad); }
+  .ctx-menu button.danger:hover:not(:disabled) { background: rgba(226,96,96,0.1); }
+
+  /* ============ Toast ============ */
+  .toasts {
+    position: fixed; right: 18px; bottom: 186px; z-index: 60;
+    display: flex; flex-direction: column; gap: 8px; align-items: flex-end;
+  }
+  .toast {
+    display: flex; align-items: center; gap: 9px;
+    background: #161C26;
+    border: 1px solid var(--border-strong);
+    border-left: 3px solid var(--ok);
+    border-radius: 7px;
+    padding: 9px 14px;
+    font-size: 12px;
+    box-shadow: 0 8px 24px rgba(0,0,0,0.5);
+    animation: toastin 0.2s ease-out;
+    max-width: 420px;
+  }
+  .toast.warn { border-left-color: var(--warn); }
+  .toast.bad { border-left-color: var(--bad); }
+  .toast .mono { font: 11px var(--mono); color: var(--dim); }
+  @keyframes toastin { from { opacity: 0; transform: translateY(8px); } }
+  .toast.out { opacity: 0; transform: translateY(6px); transition: all 0.3s; }
+
+  ::-webkit-scrollbar { width: 9px; height: 9px; }
+  ::-webkit-scrollbar-thumb { background: #232A38; border-radius: 5px; border: 2px solid var(--bg); }
+  ::-webkit-scrollbar-track { background: transparent; }
+</style>
+</head>
+<body>
+
+<!-- ===================== 顶栏 ===================== -->
+<header class="topbar">
+  <div class="logo"><b>xdview</b><span>智能摄像机客户端 · 交互原型</span></div>
+  <div class="proto-chips">
+    <span class="chip">ONVIF</span>
+    <span class="chip">RTSP · TCP</span>
+    <span class="chip">DVR 缓存</span>
+  </div>
+  <div class="spacer"></div>
+  <div class="global-state"><span class="dot on" id="global-dot"></span><span id="global-text">ONVIF 服务正常</span></div>
+  <span id="clock">--:--:--</span>
+  <button class="theme-btn" id="theme-btn" title="切换日间 / 夜间模式">
+    <svg class="icon-moon" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M21 12.8A9 9 0 1 1 11.2 3a7 7 0 0 0 9.8 9.8z"></path></svg>
+    <svg class="icon-sun" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round"><circle cx="12" cy="12" r="4"></circle><path d="M12 2v2M12 20v2M4.9 4.9l1.4 1.4M17.7 17.7l1.4 1.4M2 12h2M20 12h2M4.9 19.1l1.4-1.4M17.7 6.3l1.4-1.4"></path></svg>
+  </button>
+  <button class="theme-btn wide" id="focus-btn" title="专注模式：只看视频（Esc 退出）">
+    <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M3 8V5a2 2 0 0 1 2-2h3M16 3h3a2 2 0 0 1 2 2v3M21 16v3a2 2 0 0 1-2 2h-3M8 21H5a2 2 0 0 1-2-2v-3"></path></svg>
+    专注
+  </button>
+</header>
+
+<!-- ===================== 主布局 ===================== -->
+<div class="main">
+
+  <!-- 左侧：设备列表 -->
+  <aside class="sidebar">
+    <div class="side-head">
+      <h2>设备 · <b id="dev-count">0</b></h2>
+      <div class="side-actions">
+        <button class="btn-add" id="btn-add" title="添加设备（局域网发现 / ONVIF / 流地址）">＋ 添加</button>
+        <button class="icon-btn" id="btn-global-menu" title="导入 / 导出设备">⋯</button>
+      </div>
+    </div>
+    <div class="device-list" id="device-list"></div>
+    <div class="empty-state" id="empty-state">
+      <div>设备列表为空<br>添加一台摄像机开始预览</div>
+      <div class="btns">
+        <button class="btn accent" id="empty-add">添加设备</button>
+        <button class="btn" id="empty-import">导入设备</button>
+      </div>
+    </div>
+  </aside>
+
+  <!-- 中央：视频画布 + 操作条 + 日志 -->
+  <section class="center">
+    <div class="stage-wrap">
+      <div class="stage" id="stage">
+        <div class="scene-viewport">
+          <div class="scene" id="scene">
+            <svg viewBox="0 0 1600 900" width="1600" height="900" preserveAspectRatio="xMidYMid slice">
+              <defs>
+                <linearGradient id="sky" x1="0" y1="0" x2="0" y2="1">
+                  <stop offset="0" stop-color="#0A1226"></stop>
+                  <stop offset="0.55" stop-color="#152036"></stop>
+                  <stop offset="1" stop-color="#1E2A40"></stop>
+                </linearGradient>
+                <radialGradient id="lantern" cx="0.5" cy="0.5" r="0.5">
+                  <stop offset="0" stop-color="#E8B24A" stop-opacity="0.5"></stop>
+                  <stop offset="1" stop-color="#E8B24A" stop-opacity="0"></stop>
+                </radialGradient>
+                <radialGradient id="lampglow" cx="0.5" cy="0.5" r="0.5">
+                  <stop offset="0" stop-color="#F5D9A0" stop-opacity="0.85"></stop>
+                  <stop offset="1" stop-color="#F5D9A0" stop-opacity="0"></stop>
+                </radialGradient>
+              </defs>
+              <rect width="1600" height="900" fill="url(#sky)"></rect>
+              <circle cx="1290" cy="150" r="58" fill="#E9EDF5" opacity="0.9"></circle>
+              <circle cx="1310" cy="138" r="52" fill="#152036" opacity="0.85"></circle>
+              <g fill="#0C1524">
+                <rect x="0" y="330" width="420" height="330"></rect>
+                <rect x="440" y="260" width="300" height="400"></rect>
+                <rect x="1380" y="300" width="220" height="360"></rect>
+              </g>
+              <g fill="#F5D9A0" opacity="0.5">
+                <rect x="60" y="380" width="26" height="34"></rect>
+                <rect x="140" y="380" width="26" height="34"></rect>
+                <rect x="220" y="470" width="26" height="34"></rect>
+                <rect x="510" y="320" width="24" height="30"></rect>
+                <rect x="580" y="320" width="24" height="30"></rect>
+                <rect x="510" y="420" width="24" height="30"></rect>
+                <rect x="1440" y="360" width="22" height="28"></rect>
+                <rect x="1510" y="450" width="22" height="28"></rect>
+              </g>
+              <rect x="0" y="640" width="1600" height="260" fill="#131826"></rect>
+              <g stroke="#0E1320" stroke-width="3">
+                <line x1="0" y1="700" x2="1600" y2="700"></line>
+                <line x1="0" y1="770" x2="1600" y2="770"></line>
+                <line x1="0" y1="845" x2="1600" y2="845"></line>
+                <line x1="240" y1="640" x2="200" y2="900"></line>
+                <line x1="620" y1="640" x2="600" y2="900"></line>
+                <line x1="1000" y1="640" x2="1020" y2="900"></line>
+                <line x1="1340" y1="640" x2="1390" y2="900"></line>
+              </g>
+              <rect x="560" y="380" width="480" height="270" fill="#1A2233"></rect>
+              <rect x="560" y="380" width="480" height="270" fill="none" stroke="#242F45" stroke-width="6"></rect>
+              <rect x="590" y="415" width="180" height="235" fill="#0D1322"></rect>
+              <g stroke="#39445C" stroke-width="7">
+                <line x1="620" y1="415" x2="620" y2="650"></line>
+                <line x1="660" y1="415" x2="660" y2="650"></line>
+                <line x1="700" y1="415" x2="700" y2="650"></line>
+                <line x1="740" y1="415" x2="740" y2="650"></line>
+              </g>
+              <rect x="790" y="415" width="220" height="235" fill="#0F1626"></rect>
+              <rect x="790" y="415" width="220" height="235" fill="none" stroke="#2A3550" stroke-width="5"></rect>
+              <circle cx="985" cy="545" r="7" fill="#C8A24E"></circle>
+              <ellipse cx="680" cy="500" rx="150" ry="130" fill="url(#lampglow)"></ellipse>
+              <ellipse cx="980" cy="470" rx="130" ry="120" fill="url(#lantern)"></ellipse>
+              <g>
+                <rect x="300" y="500" width="14" height="150" fill="#232B3E"></rect>
+                <ellipse cx="307" cy="490" rx="60" ry="46" fill="url(#lampglow)"></ellipse>
+                <circle cx="307" cy="488" r="16" fill="#E8C87E"></circle>
+                <rect x="297" y="470" width="20" height="10" rx="3" fill="#232B3E"></rect>
+              </g>
+              <g>
+                <rect x="1160" y="500" width="14" height="150" fill="#232B3E"></rect>
+                <ellipse cx="1167" cy="490" rx="60" ry="46" fill="url(#lampglow)"></ellipse>
+                <circle cx="1167" cy="488" r="16" fill="#E8C87E"></circle>
+                <rect x="1157" y="470" width="20" height="10" rx="3" fill="#232B3E"></rect>
+              </g>
+              <g>
+                <rect x="430" y="610" width="52" height="40" rx="6" fill="#1C2434"></rect>
+                <path d="M436 610 Q456 560 476 610 Z" fill="#23402F"></path>
+                <rect x="820" y="620" width="46" height="34" rx="6" fill="#1C2434"></rect>
+                <path d="M826 620 Q843 578 860 620 Z" fill="#2A4A36"></path>
+                <rect x="1240" y="605" width="56" height="46" rx="6" fill="#1C2434"></rect>
+                <path d="M1247 605 Q1268 552 1289 605 Z" fill="#23402F"></path>
+              </g>
+              <rect x="1090" y="560" width="120" height="90" rx="8" fill="#141B2B" stroke="#242F45" stroke-width="4"></rect>
+              <g stroke="#39445C" stroke-width="4">
+                <line x1="1090" y1="588" x2="1210" y2="588"></line>
+                <line x1="1090" y1="616" x2="1210" y2="616"></line>
+                <line x1="1120" y1="560" x2="1120" y2="650"></line>
+                <line x1="1150" y1="560" x2="1150" y2="650"></line>
+                <line x1="1180" y1="560" x2="1180" y2="650"></line>
+              </g>
+              <g opacity="0.9">
+                <rect x="220" y="655" width="120" height="6" rx="3" fill="#0D1220"></rect>
+                <circle cx="248" cy="680" r="24" fill="none" stroke="#0D1220" stroke-width="7"></circle>
+                <circle cx="316" cy="680" r="24" fill="none" stroke="#0D1220" stroke-width="7"></circle>
+                <path d="M238 668 L296 660 L318 676 L300 668 Z" fill="#0D1220"></path>
+              </g>
+            </svg>
+          </div>
+        </div>
+        <div class="vignette"></div>
+        <div class="scanlines"></div>
+        <div class="flash" id="flash"></div>
+
+        <div class="ov ov-tl">
+          <span class="ov-cam-name" id="ov-name">—</span>
+          <button class="stream-badge clickable current" id="badge-high" title="切换到主码流">主码流</button>
+          <button class="stream-badge clickable" id="badge-sub" title="切换到子码流">子码流</button>
+        </div>
+        <div class="ov ov-tr">
+          <div class="rec-badge" id="rec-badge"><i></i>REC</div>
+          <span class="stream-badge" id="ov-time" style="cursor:default"></span>
+        </div>
+        <div class="ov ov-bl" id="ov-stats">— × — · — fps</div>
+        <div class="ov ov-br" id="ov-latency">延迟 — ms</div>
+
+        <div class="conn-mask" id="conn-mask">
+          <div class="spinner" id="conn-spinner"></div>
+          <div class="icon-big" id="conn-icon" style="display:none">◉</div>
+          <div class="big" id="conn-big">未连接</div>
+          <div class="detail" id="conn-detail">从左侧选择设备开始预览</div>
+        </div>
+
+        <button class="focus-exit" id="focus-exit" title="退出专注模式（Esc）">
+          <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M8 3v3a2 2 0 0 1-2 2H3M21 8h-3a2 2 0 0 1-2-2V3M3 16h3a2 2 0 0 1 2 2v3M16 21v-3a2 2 0 0 1 2-2h3"></path></svg>
+          还原
+        </button>
+      </div>
+    </div>
+
+    <div class="video-bar">
+      <span class="conn-text" id="conn-text">未连接</span>
+      <div class="spacer"></div>
+      <div class="seg">
+        <button id="seg-high" class="on">主码流</button>
+        <button id="seg-sub">子码流</button>
+      </div>
+      <button class="btn" id="btn-pause" disabled>暂停</button>
+      <button class="btn danger" id="btn-disconnect">断开</button>
+    </div>
+
+    <div class="log-panel">
+      <div class="log-head">
+        <h3>日志</h3>
+        <div class="spacer"></div>
+        <button class="mini" id="btn-clear-log">清空</button>
+      </div>
+      <div class="log-body" id="log-body"></div>
+    </div>
+  </section>
+
+  <!-- 右侧：控制面板 -->
+  <aside class="right">
+
+    <div class="sect" id="sect-stats">
+      <h3>实时统计 <span class="hint" id="stats-stream">H.264 · 主码流</span></h3>
+      <div class="stats-grid">
+        <div class="stat-cell"><div class="k">帧率</div><div class="v accent" id="st-fps">—<small>fps</small></div></div>
+        <div class="stat-cell"><div class="k">分辨率</div><div class="v" id="st-res">—</div></div>
+        <div class="stat-cell"><div class="k">解码吞吐</div><div class="v" id="st-mbps">—<small>MB/s</small></div></div>
+        <div class="stat-cell"><div class="k">累计帧</div><div class="v" id="st-frames">—</div></div>
+        <div class="stat-row-full"><span>解码 rawvideo → GPU 纹理</span><span id="st-uptime">运行 —</span></div>
+      </div>
+    </div>
+
+    <div class="sect disabled" id="sect-ptz">
+      <h3>云台控制 <span class="hint" id="ptz-hint">需 ONVIF PTZ</span></h3>
+      <div class="ptz-layout">
+        <div class="dpad">
+          <span></span>
+          <button data-dir="up" title="上"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.6" stroke-linecap="round" stroke-linejoin="round"><path d="M6 14l6-6 6 6"></path></svg></button>
+          <span></span>
+          <button data-dir="left" title="左"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.6" stroke-linecap="round" stroke-linejoin="round"><path d="M14 6l-6 6 6 6"></path></svg></button>
+          <button class="center-btn" data-dir="home" title="回到中心">归位</button>
+          <button data-dir="right" title="右"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.6" stroke-linecap="round" stroke-linejoin="round"><path d="M10 6l6 6-6 6"></path></svg></button>
+          <span></span>
+          <button data-dir="down" title="下"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.6" stroke-linecap="round" stroke-linejoin="round"><path d="M6 10l6 6 6-6"></path></svg></button>
+          <span></span>
+        </div>
+        <div class="ptz-side">
+          <span class="lbl">变焦</span>
+          <div class="zoom-row">
+            <button id="zoom-out">−</button>
+            <div class="zoom-track"><div class="zoom-fill" id="zoom-fill"></div></div>
+            <button id="zoom-in">＋</button>
+          </div>
+          <span class="lbl">转动速度</span>
+          <select id="ptz-speed">
+            <option value="2">低速</option>
+            <option value="4" selected>中速</option>
+            <option value="7">高速</option>
+          </select>
+          <span class="lbl">方向校正（按机型）</span>
+          <div class="invert-row">
+            <div class="toggle" id="inv-pan"><span class="sw"></span>左右反向</div>
+            <div class="toggle" id="inv-tilt"><span class="sw"></span>上下反向</div>
+          </div>
+        </div>
+      </div>
+    </div>
+
+    <div class="sect disabled" id="sect-presets">
+      <h3>预置位 <span class="hint" id="preset-hint">—</span></h3>
+      <div class="preset-grid" id="preset-grid"></div>
+      <div class="preset-note">点击预置位，云台将以最快速度转向并停留（GetGotoPreset）。</div>
+    </div>
+
+    <div class="sect disabled" id="sect-capture">
+      <h3>采集</h3>
+      <div class="capture-row">
+        <button class="cap-btn" id="btn-snapshot">
+          <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><path d="M4 8h3l2-3h6l2 3h3v11H4z"></path><circle cx="12" cy="13" r="3.4"></circle></svg>
+          截图<small>BMP</small>
+        </button>
+        <button class="cap-btn" id="btn-record">
+          <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><circle cx="12" cy="13" r="8"></circle><circle cx="12" cy="13" r="3.2" fill="currentColor" stroke="none"></circle><path d="M9 5h6"></path></svg>
+          <span id="record-label">录像</span><small>MKV · 不重编码</small>
+        </button>
+      </div>
+    </div>
+
+    <div class="sect" id="sect-cache">
+      <h3>滚动缓存（DVR）</h3>
+      <div class="cache-head">
+        <div>
+          <div class="t" id="cache-state-text">已关闭</div>
+          <div class="s" id="cache-state-sub">启动即切片落盘，只留最近 N 分钟</div>
+        </div>
+        <div class="switch" id="cache-switch" role="switch" aria-checked="false"></div>
+      </div>
+      <div class="cache-body off" id="cache-body">
+        <div class="cache-cfg">
+          <div class="field">
+            <label>保留时长</label>
+            <select id="cache-minutes">
+              <option>10 分钟</option>
+              <option selected>30 分钟</option>
+              <option>60 分钟</option>
+              <option>120 分钟</option>
+            </select>
+          </div>
+          <div class="field">
+            <label>切片粒度</label>
+            <select id="cache-seg">
+              <option>30 秒</option>
+              <option selected>60 秒</option>
+              <option>120 秒</option>
+            </select>
+          </div>
+        </div>
+        <div class="export-progress" id="export-progress">
+          <div class="bar"><div class="fill" id="export-fill"></div></div>
+          <div class="txt"><span id="export-phase">准备片段…</span><span id="export-pct">0%</span></div>
+        </div>
+        <button class="btn full accent" id="btn-export">导出最近 10 分钟</button>
+      </div>
+    </div>
+
+  </aside>
+</div>
+
+<!-- ===================== 添加设备弹层 ===================== -->
+<div class="modal-mask" id="add-mask">
+  <div class="modal" style="width:560px">
+    <div class="modal-head">
+      <h3>添加设备</h3>
+      <button class="x" id="add-close">✕</button>
+    </div>
+    <div class="tabs">
+      <button class="tab on" data-tab="discover">局域网发现</button>
+      <button class="tab" data-tab="onvif">ONVIF</button>
+      <button class="tab" data-tab="stream">流地址</button>
+    </div>
+    <div class="modal-body">
+
+      <div class="tabpane on" id="pane-discover">
+        <div class="discover-top">
+          <span class="disc-hint">打开窗口不自动扫描，手动开始探测</span>
+          <button class="btn" id="btn-discover-scan">开始扫描</button>
+        </div>
+        <div id="discover-results"></div>
+        <div id="discover-form" style="display:none">
+          <div class="field" id="f-dv-addr">
+            <label>ONVIF 服务地址 <span class="opt">（已预填）</span></label>
+            <input id="dv-addr" readonly class="ro">
+          </div>
+          <div class="field" id="f-dv-name">
+            <label>名称 <span class="opt">（留空使用主机名）</span></label>
+            <input id="dv-name" placeholder="如：阳台">
+          </div>
+          <div class="field-row">
+            <div class="field" id="f-dv-user"><label>用户名</label><input id="dv-user" autocomplete="off"></div>
+            <div class="field" id="f-dv-pass"><label>密码</label><input id="dv-pass" type="password" autocomplete="off"></div>
+          </div>
+        </div>
+      </div>
+
+      <div class="tabpane" id="pane-onvif">
+        <div class="field" id="f-of-name">
+          <label>名称 <span class="opt">（留空使用主机名）</span></label>
+          <input id="of-name" placeholder="如：书房">
+        </div>
+        <div class="field" id="f-of-addr">
+          <label>ONVIF 服务地址</label>
+          <input id="of-addr" placeholder="http://192.168.1.100:80">
+          <div class="ferr">必填，需以 http:// 开头（当前支持 HTTP）</div>
+        </div>
+        <div class="field-row">
+          <div class="field" id="f-of-user"><label>用户名</label><input id="of-user" autocomplete="off"></div>
+          <div class="field" id="f-of-pass"><label>密码</label><input id="of-pass" type="password" autocomplete="off"></div>
+        </div>
+        <div class="pane-note">流地址将在连接时经 GetStreamUri 自动获取，无需手填。</div>
+      </div>
+
+      <div class="tabpane" id="pane-stream">
+        <div class="field" id="f-st-name">
+          <label>名称 <span class="opt">（留空使用主机名）</span></label>
+          <input id="st-name" placeholder="如：后院">
+        </div>
+        <div class="field" id="f-st-main">
+          <label>主流地址</label>
+          <input id="st-main" placeholder="rtsp://192.168.1.100:554/stream1">
+          <div class="ferr">必填，需以 rtsp:// 开头</div>
+        </div>
+        <div class="field" id="f-st-sub">
+          <label>子流地址 <span class="opt">（可选）</span></label>
+          <input id="st-sub" placeholder="rtsp://192.168.1.100:554/stream2">
+        </div>
+        <div class="field-row">
+          <div class="field" id="f-st-user"><label>用户名</label><input id="st-user" autocomplete="off"></div>
+          <div class="field" id="f-st-pass"><label>密码</label><input id="st-pass" type="password" autocomplete="off"></div>
+        </div>
+      </div>
+
+    </div>
+    <div class="modal-foot-btns">
+      <span class="form-msg" id="add-msg"></span>
+      <div class="spacer"></div>
+      <button class="btn" id="add-cancel">取消</button>
+      <button class="btn primary" id="add-save">保存</button>
+      <button class="btn" id="add-save-play">保存并播放</button>
+    </div>
+  </div>
+</div>
+
+<!-- ===================== 编辑设备弹层 ===================== -->
+<div class="modal-mask" id="edit-mask">
+  <div class="modal" style="width:560px">
+    <div class="modal-head">
+      <h3>编辑设备</h3>
+      <button class="x" id="edit-close">✕</button>
+    </div>
+    <div class="modal-body">
+      <div class="field-row">
+        <div class="field" id="f-edit-name">
+          <label>名称 <span class="opt">（留空使用主机名）</span></label>
+          <input id="edit-name">
+        </div>
+        <div class="field">
+          <label>设备 ID <span class="opt">（只读，重命名不影响录像路径）</span></label>
+          <input id="edit-id" readonly class="ro">
+        </div>
+      </div>
+      <div class="field" id="f-edit-onvif">
+        <label>ONVIF 服务地址</label>
+        <input id="edit-onvif" placeholder="留空表示经 ONVIF 自动取流">
+      </div>
+      <div class="field-row">
+        <div class="field" id="f-edit-main">
+          <label>主流地址</label>
+          <input id="edit-main" placeholder="rtsp://…">
+        </div>
+        <div class="field" id="f-edit-sub">
+          <label>子流地址 <span class="opt">（可选）</span></label>
+          <input id="edit-sub" placeholder="rtsp://…">
+        </div>
+      </div>
+      <div class="field-row">
+        <div class="field" id="f-edit-user"><label>用户名</label><input id="edit-user" autocomplete="off"></div>
+        <div class="field" id="f-edit-pass">
+          <label>密码 <span class="opt">（默认遮盖）</span></label>
+          <div class="pw-wrap">
+            <input id="edit-pass" type="password" autocomplete="off">
+            <button class="btn" id="edit-pw-toggle">显示</button>
+          </div>
+        </div>
+      </div>
+      <div class="pane-note">仅改名称不重连；当前设备的地址或账号变化时，保存后将断开并重连。取消不修改配置。</div>
+    </div>
+    <div class="modal-foot-btns">
+      <span class="form-msg" id="edit-msg"></span>
+      <div class="spacer"></div>
+      <button class="btn" id="edit-cancel">取消</button>
+      <button class="btn primary" id="edit-save">保存</button>
+    </div>
+  </div>
+</div>
+
+<!-- ===================== 删除确认弹层 ===================== -->
+<div class="modal-mask" id="del-mask">
+  <div class="modal small">
+    <div class="modal-head">
+      <h3>删除设备</h3>
+      <button class="x" id="del-close">✕</button>
+    </div>
+    <div class="modal-body">
+      <p class="lead" id="del-text"></p>
+      <p class="del-note">仅移除设备配置，已有录像、截图和缓存文件全部保留。</p>
+      <div class="del-impact" id="del-impact"></div>
+    </div>
+    <div class="modal-foot-btns">
+      <div class="spacer"></div>
+      <button class="btn" id="del-cancel">取消</button>
+      <button class="btn danger" id="del-ok">删除</button>
+    </div>
+  </div>
+</div>
+
+<!-- ===================== 浮动菜单 ===================== -->
+<div class="ctx-menu" id="dev-menu">
+  <button data-act="play">播放</button>
+  <button data-act="disconnect">断开</button>
+  <hr>
+  <button data-act="edit">编辑</button>
+  <button data-act="del" class="danger">删除</button>
+</div>
+<div class="ctx-menu" id="global-menu">
+  <button data-act="import">导入设备…</button>
+  <button data-act="export">导出设备…</button>
+</div>
+
+<div class="toasts" id="toasts"></div>
+
+<script>
+(function () {
+  "use strict";
+
+  /* ---------- 数据 ---------- */
+  /* host 仅含 主机:端口，不展示账号、路径或查询参数 */
+  var devices = [
+    { id: "cam-xiaodu-3484", name: "门口", host: "192.168.1.23:80", onvif: "http://192.168.1.23:80",
+      main: "", sub: "", user: "admin", pass: "",
+      caps: { ptz: true, presets: 4 }, presets: ["门口全景", "门牌特写", "车道", "楼道口"] },
+    { id: "cam-tplink-43aw", name: "客厅", host: "192.168.1.10:80", onvif: "http://192.168.1.10:80",
+      main: "rtsp://192.168.1.10:554/stream1", sub: "rtsp://192.168.1.10:554/stream2", user: "admin", pass: "",
+      caps: { ptz: true, presets: 8 }, presets: ["沙发区", "餐桌", "入户门", "阳台", "电视墙", "走廊", "宠物角", "窗边"] },
+    { id: "cam-hik-3t46", name: "车库", host: "192.168.1.31:80", onvif: "http://192.168.1.31:80",
+      main: "", sub: "", user: "admin", pass: "", offline: true,
+      caps: { ptz: false, presets: 0 }, presets: [] }
+  ];
+  var presetViews = [
+    { x: 0, y: 0, z: 1 }, { x: 200, y: -70, z: 1.55 }, { x: -230, y: 60, z: 1.3 }, { x: 80, y: 90, z: 1.75 },
+    { x: -140, y: -40, z: 1.35 }, { x: 150, y: 30, z: 1.6 }, { x: -60, y: -110, z: 1.7 }, { x: 240, y: 50, z: 1.4 }
+  ];
+
+  /* 连接状态（仅当前设备存在活动状态，其余设备一律显示「未连接」，不推断在线离线） */
+  var STATUS = {
+    idle:         { label: "未连接",   cls: "idle" },
+    connecting:   { label: "连接中",   cls: "connecting pulse" },
+    waiting:      { label: "等待画面", cls: "waiting pulse" },
+    live:         { label: "播放中",   cls: "live" },
+    paused:       { label: "已暂停",   cls: "paused" },
+    reconnecting: { label: "重连中",   cls: "reconnecting pulse" },
+    failed:       { label: "连接失败", cls: "failed" }
+  };
+  var FAIL_NEXT = "下一步：检查设备电源与网络，单击设备或菜单「播放」重试。";
+
+  var state = {
+    selected: 0,             // 可空：删除后允许为 -1
+    conn: "idle",            // idle | connecting | waiting | live | paused | reconnecting | failed
+    gen: 0,                  // 连接代次：连接/断开/删除即递增，旧回执作废
+    retry: 0,
+    failReason: "",
+    high: true,
+    rec: false,
+    pan: { x: 0, y: 0 },
+    zoom: 1,
+    invertPan: false,
+    invertTilt: false,
+    cacheOn: false,
+    exporting: false,
+    frames: 0,
+    liveSince: null,
+    holdTimer: null,
+    holdDir: null
+  };
+
+  /* ---------- 工具 ---------- */
+  function $(id) { return document.getElementById(id); }
+  function pad(n) { return n < 10 ? "0" + n : "" + n; }
+  function nowStr() {
+    var d = new Date();
+    return d.getFullYear() + "-" + pad(d.getMonth() + 1) + "-" + pad(d.getDate()) + " " + pad(d.getHours()) + ":" + pad(d.getMinutes()) + ":" + pad(d.getSeconds());
+  }
+  function ts() {
+    var d = new Date();
+    return pad(d.getHours()) + ":" + pad(d.getMinutes()) + ":" + pad(d.getSeconds());
+  }
+
+  function log(level, msg) {
+    var body = $("log-body");
+    var line = document.createElement("div");
+    line.className = "log-line";
+    line.innerHTML = '<span class="t">' + ts() + '</span><span class="lv ' + level + '">' + level + '</span><span class="msg"></span>';
+    line.querySelector(".msg").textContent = msg;
+    body.appendChild(line);
+    while (body.children.length > 200) { body.removeChild(body.firstChild); }
+    body.scrollTop = body.scrollHeight;
+  }
+
+  function toast(msg, mono, kind) {
+    var box = $("toasts");
+    var t = document.createElement("div");
+    t.className = "toast" + (kind ? " " + kind : "");
+    t.innerHTML = '<span class="txt"></span>' + (mono ? '<span class="mono"></span>' : "");
+    t.querySelector(".txt").textContent = msg;
+    if (mono) { t.querySelector(".mono").textContent = mono; }
+    box.appendChild(t);
+    setTimeout(function () { t.classList.add("out"); }, 3400);
+    setTimeout(function () { if (t.parentNode) { t.parentNode.removeChild(t); } }, 3800);
+  }
+
+  /* ---------- 场景（模拟画面） ---------- */
+  function applyScene(animated) {
+    var s = $("scene");
+    if (animated) { s.classList.add("animated"); setTimeout(function () { s.classList.remove("animated"); }, 750); }
+    var x = state.invertPan ? -state.pan.x : state.pan.x;
+    var y = state.invertTilt ? -state.pan.y : state.pan.y;
+    s.style.transform = "translate(calc(-50% + " + x + "px), calc(-50% + " + y + "px)) scale(" + state.zoom + ")";
+    $("zoom-fill").style.width = Math.round((state.zoom - 1) / 0.8 * 100) + "%";
+  }
+  function clampPan() {
+    state.pan.x = Math.max(-320, Math.min(320, state.pan.x));
+    state.pan.y = Math.max(-160, Math.min(160, state.pan.y));
+  }
+
+  /* ---------- 地址工具 ---------- */
+  function hostOf(addr) {
+    var m = (addr || "").trim().match(/^(?:[a-z][a-z0-9+.-]*:\/\/)?([^\/?#]+)/i);
+    return m ? m[1] : (addr || "");
+  }
+  function normAddr(a) { return (a || "").trim().replace(/\/+$/, "").toLowerCase(); }
+  function hostnameOf(d) {
+    var h = hostOf(d.onvif || d.main || d.host).replace(/:\d+$/, "");
+    return h || d.host;
+  }
+
+  /* ---------- 设备列表 ---------- */
+  function renderDevices() {
+    var list = $("device-list");
+    list.innerHTML = "";
+    $("dev-count").textContent = devices.length;
+    var empty = devices.length === 0;
+    $("empty-state").classList.toggle("show", empty);
+    list.style.display = empty ? "none" : "";
+    devices.forEach(function (d, i) {
+      var isCur = i === state.selected;
+      var conn = isCur ? state.conn : "idle";
+      var meta = STATUS[conn];
+      var card = document.createElement("div");
+      card.className = "device-card" + (isCur ? " active" : "") + (conn === "failed" ? " is-failed" : "");
+      card.setAttribute("role", "button");
+      card.setAttribute("tabindex", "0");
+      card.innerHTML =
+        '<div class="row1">' +
+          '<span class="dname"></span>' +
+          '<span class="st ' + meta.cls + '" title="' + (conn === "failed" ? state.failReason + " " + FAIL_NEXT : "") + '">' +
+            '<i></i><span class="stt"></span>' +
+          '</span>' +
+          '<button class="dmenu" title="设备菜单">⋯</button>' +
+        '</div>' +
+        '<div class="row2"><span class="dhost"></span></div>';
+      card.querySelector(".dname").textContent = d.name;
+      card.querySelector(".dname").title = d.name;
+      card.querySelector(".stt").textContent = meta.label;
+      card.querySelector(".dhost").textContent = d.host;
+      card.querySelector(".dhost").title = d.host;
+      card.addEventListener("click", function () { selectDevice(i); });
+      card.addEventListener("keydown", function (e) {
+        if (e.key === "Enter" || e.key === " ") { e.preventDefault(); selectDevice(i); }
+      });
+      card.querySelector(".dmenu").addEventListener("click", function (e) {
+        e.stopPropagation();
+        openDevMenu(i, this);
+      });
+      list.appendChild(card);
+    });
+  }
+
+  /* 单击规则：切他机即播；点当前播放/暂停/连接中不重连；未连接/失败才重连 */
+  function selectDevice(i) {
+    if (i !== state.selected) {
+      if (state.rec) { toggleRecord(true); }
+      stopHold();
+      state.selected = i;
+      renderDevices();
+      connect();
+      return;
+    }
+    if (state.conn === "live" || state.conn === "paused" ||
+        state.conn === "connecting" || state.conn === "waiting" || state.conn === "reconnecting") {
+      log("INFO", "已在 " + devices[i].name + " 上（" + STATUS[state.conn].label + "），单击不重连。");
+      return;
+    }
+    connect(); // 未连接 / 连接失败 → 重新连接
+  }
+
+  function connect() {
+    state.gen++;
+    var gen = state.gen;
+    var d = devices[state.selected];
+    if (!d) { state.conn = "idle"; updateConnUI(); renderDevices(); return; }
+    stopHold();
+    state.retry = 0;
+    state.conn = "connecting";
+    state.pan = { x: 0, y: 0 };
+    state.zoom = 1;
+    applyScene(false);
+    updateConnUI();
+    renderDevices();
+    log("INFO", "连接 " + d.name + "（" + d.host + "）…");
+    setTimeout(function () {
+      if (gen !== state.gen) { return; }
+      if (d.offline) {
+        setFailed(d, gen, "ONVIF 握手超时：设备无响应（" + d.host + "）。");
+        return;
+      }
+      state.conn = "waiting";
+      updateConnUI();
+      renderDevices();
+      log("INFO", "ONVIF 握手通过，GetStreamUri → RTSP DESCRIBE，等待首帧…");
+      setTimeout(function () {
+        if (gen !== state.gen) { return; }
+        state.conn = "live";
+        state.frames = 0;
+        state.liveSince = Date.now();
+        updateConnUI();
+        renderDevices();
+        log("OK", d.name + " 已出画面（收到首帧） · " + streamUriOf(d));
+        syncPanels();
+      }, 850);
+    }, 900);
+  }
+
+  function streamUriOf(d) {
+    if (d.main) { return d.main; }
+    return "rtsp://" + d.host.replace(/:\d+$/, "") + ":554/（ONVIF 自动取流）";
+  }
+
+  /* 失败 → 指数退避自动重连（重连中 → 失败循环），断开/切换即作废 */
+  function setFailed(d, gen, reason) {
+    if (gen !== state.gen) { return; }
+    state.conn = "failed";
+    state.failReason = reason;
+    updateConnUI();
+    renderDevices();
+    log("ERR", d.name + " 连接失败：" + reason);
+    toast("连接失败", d.name + " · 单击设备可重试", "bad");
+    state.retry++;
+    setTimeout(function () {
+      if (gen !== state.gen) { return; }
+      state.conn = "reconnecting";
+      updateConnUI();
+      renderDevices();
+      log("INFO", "第 " + state.retry + " 次自动重连（指数退避）…");
+      setTimeout(function () {
+        if (gen !== state.gen) { return; }
+        setFailed(d, gen, reason);
+      }, 1600);
+    }, 3000);
+  }
+
+  function disconnect(silent) {
+    state.gen++;
+    stopHold();
+    if (state.rec) { toggleRecord(true); }
+    state.conn = "idle";
+    state.liveSince = null;
+    state.retry = 0;
+    updateConnUI();
+    renderDevices();
+    if (!silent) { log("INFO", "已断开连接。"); }
+  }
+
+  /* ---------- 连接态 UI ---------- */
+  function updateConnUI() {
+    var d = devices[state.selected] || { name: "", host: "" };
+    var mask = $("conn-mask"), big = $("conn-big"), detail = $("conn-detail"),
+        sp = $("conn-spinner"), icon = $("conn-icon"), ct = $("conn-text");
+    var live = state.conn === "live";
+    mask.classList.toggle("hidden", live);
+    sp.style.display = (state.conn === "connecting" || state.conn === "waiting" || state.conn === "reconnecting") ? "block" : "none";
+    icon.style.display = (state.conn === "failed" || state.conn === "idle") ? "block" : "none";
+    $("ov-name").textContent = d.name || "—";
+    $("badge-high").style.display = live ? "" : "none";
+    $("badge-sub").style.display = live ? "" : "none";
+    $("rec-badge").classList.toggle("on", state.rec && live);
+    $("btn-disconnect").disabled = state.conn === "idle";
+    var pb = $("btn-pause");
+    pb.disabled = !(live || state.conn === "paused");
+    pb.textContent = state.conn === "paused" ? "继续" : "暂停";
+
+    if (state.conn === "idle") {
+      icon.textContent = "◉";
+      big.textContent = "未连接";
+      detail.className = "detail";
+      detail.textContent = devices.length ? "从左侧选择设备开始预览" : "添加一台设备开始预览";
+      ct.innerHTML = "未连接";
+    } else if (state.conn === "connecting") {
+      big.textContent = "正在连接 " + d.name + " …";
+      detail.className = "detail";
+      detail.textContent = "ONVIF 握手 → GetProfiles → GetStreamUri";
+      ct.innerHTML = "连接中…";
+    } else if (state.conn === "waiting") {
+      big.textContent = "等待画面";
+      detail.className = "detail";
+      detail.textContent = "取流成功，等待解码首帧（未出画面不算播放中）";
+      ct.innerHTML = "等待画面…";
+    } else if (state.conn === "paused") {
+      big.textContent = "已暂停";
+      detail.className = "detail";
+      detail.textContent = "连接保持中，单击「继续」恢复画面";
+      ct.innerHTML = "已暂停 · " + d.name;
+    } else if (state.conn === "reconnecting") {
+      big.textContent = "自动重连中";
+      detail.className = "detail";
+      detail.textContent = "第 " + state.retry + " 次重试（指数退避 0.5s → 8s）…";
+      ct.innerHTML = "重连中…";
+    } else if (state.conn === "failed") {
+      big.textContent = "连接失败";
+      detail.className = "detail bad";
+      detail.textContent = state.failReason + " " + FAIL_NEXT;
+      ct.innerHTML = '<b style="color:var(--bad)">连接失败</b> · ' + d.name;
+    } else {
+      ct.innerHTML = "<b>实时预览</b> · " + d.name + " · " + (state.high ? "主码流" : "子码流");
+    }
+    syncPanels();
+  }
+
+  function syncPanels() {
+    var live = state.conn === "live";
+    var d = devices[state.selected];
+    if (!d) {
+      ["sect-ptz", "sect-presets", "sect-capture"].forEach(function (id) { $(id).classList.add("disabled"); });
+      $("preset-grid").innerHTML = "";
+      $("btn-export").disabled = true;
+      return;
+    }
+    var ptzOk = live && d.caps.ptz;
+    $("sect-ptz").classList.toggle("disabled", !ptzOk);
+    $("sect-presets").classList.toggle("disabled", !ptzOk || d.presets.length === 0);
+    $("sect-capture").classList.toggle("disabled", !live);
+    $("ptz-hint").textContent = ptzOk ? "ONVIF PTZ" : (d.caps.ptz ? "需连接" : "设备不支持");
+    $("preset-hint").textContent = d.presets.length ? d.presets.length + " 个" : "无";
+    var grid = $("preset-grid");
+    grid.innerHTML = "";
+    d.presets.forEach(function (p, i) {
+      var b = document.createElement("button");
+      b.className = "preset-btn";
+      b.innerHTML = '<span class="no">' + (i + 1) + '</span><span class="pn"></span>';
+      b.querySelector(".pn").textContent = p;
+      b.addEventListener("click", function () {
+        var v = presetViews[i % presetViews.length];
+        state.pan = { x: v.x, y: v.y };
+        state.zoom = v.z;
+        applyScene(true);
+        log("INFO", "云台跳转预置位 " + (i + 1) + "「" + p + "」");
+      });
+      grid.appendChild(b);
+    });
+    for (var j = d.presets.length; j < 4; j++) {
+      var e = document.createElement("div");
+      e.className = "preset-btn empty";
+      e.innerHTML = '<span class="no">' + (j + 1) + '</span><span class="pn">未设置</span>';
+      grid.appendChild(e);
+    }
+    $("cache-state-text").textContent = state.cacheOn ? "运行中 · 切片落盘" : "已关闭";
+    $("cache-state-sub").textContent = state.cacheOn
+      ? "保留最近 " + $("cache-minutes").value + " · 每片 " + $("cache-seg").value
+      : "启动即切片落盘，只留最近 N 分钟";
+    $("btn-export").disabled = !state.cacheOn || !live || state.exporting;
+  }
+
+  /* ---------- 云台 ---------- */
+  function startHold(dir, btn) {
+    stopHold();
+    state.holdDir = dir;
+    btn.classList.add("holding");
+    var speed = parseInt($("ptz-speed").value, 10);
+    var d = devices[state.selected];
+    log("INFO", "PTZ " + dir + " · speed=" + speed + (state.invertPan && (dir === "left" || dir === "right") ? "（已反向）" : "") + (state.invertTilt && (dir === "up" || dir === "down") ? "（已反向）" : ""));
+    state.holdTimer = setInterval(function () {
+      if (dir === "left") { state.pan.x -= speed; }
+      if (dir === "right") { state.pan.x += speed; }
+      if (dir === "up") { state.pan.y -= Math.round(speed * 0.7); }
+      if (dir === "down") { state.pan.y += Math.round(speed * 0.7); }
+      if (dir === "home") {
+        state.pan = { x: 0, y: 0 };
+        state.zoom = 1;
+        applyScene(true);
+        stopHold();
+        log("INFO", "云台归位（Home）");
+        return;
+      }
+      clampPan();
+      applyScene(false);
+    }, 30);
+  }
+  function stopHold() {
+    if (state.holdTimer) { clearInterval(state.holdTimer); state.holdTimer = null; }
+    if (state.holdDir) {
+      var btn = document.querySelector('.dpad [data-dir="' + state.holdDir + '"]');
+      if (btn) { btn.classList.remove("holding"); }
+      if (state.holdDir !== "home") { log("INFO", "PTZ 停止 · 当前角度 pan=" + state.pan.x + " tilt=" + state.pan.y); }
+      state.holdDir = null;
+    }
+  }
+  Array.prototype.forEach.call(document.querySelectorAll(".dpad [data-dir]"), function (btn) {
+    var dir = btn.getAttribute("data-dir");
+    if (dir === "home") {
+      btn.addEventListener("click", function () {
+        if (state.conn !== "live") { return; }
+        state.pan = { x: 0, y: 0 }; state.zoom = 1; applyScene(true);
+        log("INFO", "云台归位（Home）");
+      });
+      return;
+    }
+    btn.addEventListener("pointerdown", function (e) {
+      if (state.conn !== "live") { return; }
+      e.preventDefault();
+      startHold(dir, btn);
+    });
+    btn.addEventListener("pointerup", stopHold);
+    btn.addEventListener("pointerleave", stopHold);
+  });
+  $("zoom-in").addEventListener("click", function () {
+    if (state.conn !== "live") { return; }
+    state.zoom = Math.min(1.8, state.zoom + 0.15);
+    applyScene(false);
+    log("INFO", "变焦 ZoomIn → " + state.zoom.toFixed(2) + "x");
+  });
+  $("zoom-out").addEventListener("click", function () {
+    if (state.conn !== "live") { return; }
+    state.zoom = Math.max(1, state.zoom - 0.15);
+    applyScene(false);
+    log("INFO", "变焦 ZoomOut → " + state.zoom.toFixed(2) + "x");
+  });
+  $("inv-pan").addEventListener("click", function () {
+    state.invertPan = !state.invertPan;
+    this.classList.toggle("on", state.invertPan);
+    log("WARN", "invert_pan = " + state.invertPan + "（方向校正立即生效）");
+    applyScene(false);
+  });
+  $("inv-tilt").addEventListener("click", function () {
+    state.invertTilt = !state.invertTilt;
+    this.classList.toggle("on", state.invertTilt);
+    log("WARN", "invert_tilt = " + state.invertTilt + "（方向校正立即生效）");
+    applyScene(false);
+  });
+
+  /* ---------- 码流切换 ---------- */
+  function setStream(high) {
+    if (state.high === high) { return; }
+    state.high = high;
+    $("badge-high").classList.toggle("current", high);
+    $("badge-sub").classList.toggle("current", !high);
+    $("seg-high").classList.toggle("on", high);
+    $("seg-sub").classList.toggle("on", !high);
+    $("stats-stream").textContent = "H.264 · " + (high ? "主码流" : "子码流");
+    log("INFO", "切换到" + (high ? "主" : "子") + "码流（rtsp 重协商，约 1s 黑屏）");
+    toast("已切换到" + (high ? "主" : "子") + "码流", high ? "1280×720" : "640×360");
+  }
+  $("badge-high").addEventListener("click", function () { setStream(true); });
+  $("badge-sub").addEventListener("click", function () { setStream(false); });
+  $("seg-high").addEventListener("click", function () { setStream(true); });
+  $("seg-sub").addEventListener("click", function () { setStream(false); });
+
+  /* ---------- 截图 / 录像 ---------- */
+  $("btn-snapshot").addEventListener("click", function () {
+    if (state.conn !== "live") { return; }
+    var f = $("flash");
+    f.classList.remove("go");
+    void f.offsetWidth;
+    f.classList.add("go");
+    var d = devices[state.selected];
+    var file = "exports/" + d.id + "_" + new Date().toISOString().slice(0, 10).replace(/-/g, "") + "_" + ts().replace(/:/g, "") + ".bmp";
+    log("OK", "截图已保存 → " + file);
+    toast("截图已保存", file);
+  });
+
+  function toggleRecord(silentStop) {
+    var d = devices[state.selected];
+    if (!state.rec) {
+      state.rec = true;
+      var file = "recordings/" + d.id + "_" + ts().replace(/:/g, "") + ".mkv";
+      $("record-label").textContent = "停止";
+      $("btn-record").classList.add("rec-on");
+      log("OK", "开始录像 → " + file + "（-c copy，不重编码）");
+      toast("开始录像", file);
+    } else {
+      state.rec = false;
+      $("record-label").textContent = "录像";
+      $("btn-record").classList.remove("rec-on");
+      log("OK", "录像已停止，文件已封口（进程被杀也不坏文件）。");
+      if (!silentStop) { toast("录像已保存", "MKV 已封口写入 recordings/"); }
+    }
+    updateConnUI();
+  }
+  $("btn-record").addEventListener("click", function () {
+    if (state.conn !== "live") { return; }
+    toggleRecord(false);
+  });
+
+  /* ---------- 滚动缓存 ---------- */
+  $("cache-switch").addEventListener("click", function () {
+    state.cacheOn = !state.cacheOn;
+    this.classList.toggle("on", state.cacheOn);
+    this.setAttribute("aria-checked", state.cacheOn ? "true" : "false");
+    $("cache-body").classList.toggle("off", !state.cacheOn);
+    var live = state.conn === "live";
+    log(state.cacheOn ? "OK" : "INFO", state.cacheOn
+      ? "滚动缓存已开启：实时流按 " + $("cache-seg").value + " 切片落盘，只保留最近 " + $("cache-minutes").value
+      : "滚动缓存已关闭，残片将在下次启动时清理。");
+    if (state.cacheOn && live) { toast("滚动缓存已开启", "cache/" + devices[state.selected].id + "/"); }
+    syncPanels();
+  });
+  $("cache-minutes").addEventListener("change", syncPanels);
+  $("cache-seg").addEventListener("change", syncPanels);
+
+  $("btn-export").addEventListener("click", function () {
+    if (state.exporting || !state.cacheOn || state.conn !== "live") { return; }
+    state.exporting = true;
+    this.disabled = true;
+    var prog = $("export-progress");
+    prog.classList.add("show");
+    var pct = 0, fill = $("export-fill"), pt = $("export-pct"), ph = $("export-phase");
+    ph.textContent = "挑选最近 10 片…";
+    var timer = setInterval(function () {
+      pct += Math.random() * 9 + 4;
+      if (pct >= 46 && ph.textContent.indexOf("挑选") >= 0) { ph.textContent = "concat 拼接中（-c copy）…"; }
+      if (pct >= 88) { ph.textContent = "ffprobe 校验时长…"; }
+      if (pct >= 100) {
+        pct = 100;
+        clearInterval(timer);
+        var d = devices[state.selected];
+        var file = "exports/" + d.id + "_last10min.mkv";
+        log("OK", "导出完成 → " + file + "（10:00 · 42.3 MB · 不重编码）");
+        toast("导出完成", file);
+        setTimeout(function () {
+          prog.classList.remove("show");
+          fill.style.width = "0%";
+          state.exporting = false;
+          $("btn-export").disabled = false;
+        }, 900);
+      }
+      fill.style.width = pct + "%";
+      pt.textContent = Math.round(pct) + "%";
+    }, 140);
+  });
+
+  /* ---------- 浮动菜单：设备 ⋯ / 全局更多 ---------- */
+  var devMenu = $("dev-menu");
+
+  function openDevMenu(i, anchor) {
+    var d = devices[i];
+    var isCur = i === state.selected;
+    var busy = isCur && (state.conn === "live" || state.conn === "paused" ||
+                         state.conn === "connecting" || state.conn === "waiting");
+    devMenu.querySelector('[data-act="play"]').textContent = busy ? "重新连接" : "播放";
+    devMenu.querySelector('[data-act="disconnect"]').disabled = !(isCur && state.conn !== "idle");
+    devMenu.dataset.index = i;
+    var r = anchor.getBoundingClientRect();
+    devMenu.classList.add("show");
+    var top = r.bottom + 4;
+    if (top + devMenu.offsetHeight > window.innerHeight - 8) { top = r.top - devMenu.offsetHeight - 4; }
+    devMenu.style.left = Math.max(8, Math.min(r.left, window.innerWidth - devMenu.offsetWidth - 8)) + "px";
+    devMenu.style.top = top + "px";
+  }
+
+  document.addEventListener("click", function (e) {
+    if (!devMenu.contains(e.target)) { devMenu.classList.remove("show"); }
+    var gm = $("global-menu"), gbtn = $("btn-global-menu");
+    if (!gm.contains(e.target) && e.target !== gbtn && !gbtn.contains(e.target)) { gm.classList.remove("show"); }
+  });
+
+  devMenu.addEventListener("click", function (e) {
+    var btn = e.target.closest("button");
+    if (!btn || btn.disabled) { return; }
+    var i = parseInt(devMenu.dataset.index, 10);
+    var act = btn.dataset.act;
+    devMenu.classList.remove("show");
+    if (act === "play") {
+      if (i === state.selected && state.conn !== "idle" && state.conn !== "failed") {
+        if (state.rec) { toggleRecord(true); }
+        log("INFO", "重新连接 " + devices[i].name + "：断开旧会话…");
+        connect();
+      } else {
+        state.selected = i;
+        renderDevices();
+        connect();
+      }
+    } else if (act === "disconnect") {
+      if (i === state.selected) { disconnect(false); }
+    } else if (act === "edit") {
+      openEdit(i);
+    } else if (act === "del") {
+      openDelete(i);
+    }
+  });
+
+  $("btn-global-menu").addEventListener("click", function (e) {
+    e.stopPropagation();
+    devMenu.classList.remove("show");
+    var gm = $("global-menu");
+    var show = !gm.classList.contains("show");
+    gm.classList.remove("show");
+    if (show) {
+      var r = this.getBoundingClientRect();
+      gm.style.left = Math.max(8, r.left - 110) + "px";
+      gm.style.top = r.bottom + 6 + "px";
+      gm.classList.add("show");
+    }
+  });
+
+  $("global-menu").addEventListener("click", function (e) {
+    var btn = e.target.closest("button");
+    if (!btn) { return; }
+    $("global-menu").classList.remove("show");
+    if (btn.dataset.act === "import") {
+      log("INFO", "导入设备（模拟）：按 ID／规范化 ONVIF 地址去重");
+      toast("导入设备", "原型模拟：选择导出文件后按 ID／ONVIF 去重", "warn");
+    } else {
+      log("OK", "已导出 " + devices.length + " 台设备（不含凭据与画面）");
+      toast("已导出 " + devices.length + " 台设备", "cameras-export.toml · 不含凭据");
+    }
+  });
+
+  /* ---------- 添加设备 ---------- */
+  function fieldErr(id, on) { $(id).classList.toggle("err", !!on); }
+  function setAddMsg(s) { $("add-msg").textContent = s || ""; }
+
+  function switchAddTab(name) {
+    document.querySelectorAll("#add-mask .tab").forEach(function (t) { t.classList.toggle("on", t.dataset.tab === name); });
+    document.querySelectorAll("#add-mask .tabpane").forEach(function (p) { p.classList.toggle("on", p.id === "pane-" + name); });
+    setAddMsg("");
+  }
+  document.querySelectorAll("#add-mask .tab").forEach(function (t) {
+    t.addEventListener("click", function () { switchAddTab(t.dataset.tab); });
+  });
+
+  function openAdd() {
+    switchAddTab("discover");
+    $("discover-results").innerHTML = '<div class="scan-progress" style="padding:18px 4px">打开窗口不自动扫描，单击「开始扫描」探测局域网内的 ONVIF 设备。</div>';
+    $("discover-form").style.display = "none";
+    ["of-name", "of-addr", "of-user", "of-pass", "st-name", "st-main", "st-sub", "st-user", "st-pass"].forEach(function (id) { $(id).value = ""; });
+    ["f-of-addr", "f-st-main"].forEach(function (id) { fieldErr(id, false); });
+    setAddMsg("");
+    $("add-mask").classList.add("show");
+  }
+  $("btn-add").addEventListener("click", openAdd);
+  $("empty-add").addEventListener("click", openAdd);
+  $("empty-import").addEventListener("click", function () {
+    log("INFO", "导入设备（模拟）：空列表导入后恢复配置");
+    toast("导入设备", "原型模拟：按 ID／ONVIF 地址去重导入", "warn");
+  });
+
+  /* 局域网发现：手动扫描 → 选择预填 → 共用表单 */
+  var scanFoundList = [
+    { name: "阳台", brand: "大华", model: "IPC-HFW2433M", host: "192.168.1.45", onvif: "http://192.168.1.45:80", ptz: true },
+    { name: "客厅", brand: "TP-Link", model: "TL-IPC43AW", host: "192.168.1.10", onvif: "http://192.168.1.10:80", ptz: true }
+  ];
+  var discoverSel = null;
+
+  $("btn-discover-scan").addEventListener("click", function () {
+    var btn = this;
+    btn.disabled = true; btn.textContent = "扫描中…";
+    $("discover-results").innerHTML = '<div class="scan-progress"><div class="spinner" style="width:22px;height:22px"></div><span>WS-Discovery 组播 239.255.255.250:3702，超时 3s…</span></div>';
+    $("discover-form").style.display = "none";
+    log("INFO", "WS-Discovery 扫描启动（组播 239.255.255.250:3702，超时 3s）…");
+    setTimeout(function () {
+      btn.disabled = false; btn.textContent = "重新扫描";
+      var box = $("discover-results");
+      box.innerHTML = "";
+      scanFoundList.forEach(function (f) {
+        var existed = devices.filter(function (d) {
+          return normAddr(d.onvif) === normAddr(f.onvif) || d.host === f.host;
+        })[0];
+        var item = document.createElement("div");
+        item.className = "found-item" + (existed ? " added" : "");
+        item.innerHTML =
+          '<div class="fi-main"><div class="fi-name"></div><div class="fi-meta"></div></div>' +
+          (existed ? '<button class="btn" data-act="play">播放已有设备</button>'
+                   : '<button class="btn accent" data-act="pick">选择</button>');
+        item.querySelector(".fi-name").textContent = f.name + " · " + f.brand;
+        item.querySelector(".fi-meta").textContent = f.model + " · " + f.host;
+        item.querySelector("button").addEventListener("click", function () {
+          if (existed) {
+            $("add-mask").classList.remove("show");
+            state.selected = devices.indexOf(existed);
+            renderDevices();
+            connect();
+            log("OK", "播放已有设备：" + existed.name + "（不重复添加）");
+          } else {
+            discoverSel = f;
+            $("dv-addr").value = f.onvif;
+            $("dv-name").value = "";
+            $("dv-user").value = "";
+            $("dv-pass").value = "";
+            $("discover-form").style.display = "";
+            log("INFO", "已预填 ONVIF 地址 " + f.onvif + "，请补全名称与账号。");
+          }
+        });
+        box.appendChild(item);
+      });
+      log("OK", "扫描完成：发现 " + scanFoundList.length + " 台 ONVIF 设备");
+    }, 1600);
+  });
+
+  /* 校验 + 收集（按来源去重：ONVIF 按规范化地址，流设备按主流地址） */
+  function validateAndCollect(source) {
+    setAddMsg("");
+    if (source === "stream") {
+      fieldErr("f-st-main", false);
+      var main = $("st-main").value.trim();
+      var name = $("st-name").value.trim();
+      var sub = $("st-sub").value.trim();
+      if (!main) { fieldErr("f-st-main", true); setAddMsg("主流地址必填"); return null; }
+      if (!/^rtsp:\/\//i.test(main)) { fieldErr("f-st-main", true); setAddMsg("主流地址需以 rtsp:// 开头"); return null; }
+      var dup = devices.filter(function (d) { return normAddr(d.main) === normAddr(main); })[0];
+      if (dup) { fieldErr("f-st-main", true); setAddMsg("该主流地址已存在（「" + dup.name + "」）"); return null; }
+      return { name: name, host: hostOf(main), onvif: "", main: main, sub: sub,
+               user: $("st-user").value, pass: $("st-pass").value };
+    }
+    var fid = source === "discover" ? "dv" : "of";
+    fieldErr("f-" + fid + "-addr", false);
+    var onvif = $(fid + "-addr").value.trim();
+    var name2 = $(fid + "-name").value.trim();
+    if (!onvif) { fieldErr("f-" + fid + "-addr", true); setAddMsg("ONVIF 服务地址必填"); return null; }
+    if (!/^http:\/\//i.test(onvif)) { fieldErr("f-" + fid + "-addr", true); setAddMsg("ONVIF 地址需以 http:// 开头（当前支持 HTTP）"); return null; }
+    var dup2 = devices.filter(function (d) { return normAddr(d.onvif) === normAddr(onvif); })[0];
+    if (dup2) { fieldErr("f-" + fid + "-addr", true); setAddMsg("该 ONVIF 地址已存在（「" + dup2.name + "」）"); return null; }
+    return { name: name2, host: hostOf(onvif), onvif: onvif, main: "", sub: "",
+             user: $(fid + "-user").value, pass: $(fid + "-pass").value,
+             ptz: source === "discover" && discoverSel && discoverSel.ptz };
+  }
+
+  function makeDevice(c) {
+    return {
+      id: "cam-" + Date.now().toString(36),
+      name: c.name || hostOf(c.onvif || c.main).replace(/:\d+$/, "") || c.host,
+      host: c.host, onvif: c.onvif, main: c.main, sub: c.sub,
+      user: c.user, pass: c.pass,
+      caps: { ptz: !!c.ptz, presets: c.ptz ? 2 : 0 },
+      presets: c.ptz ? ["全场景", "车位"] : []
+    };
+  }
+
+  /* 保存：不切换当前设备、不发起连接；保存并播放：切换并连接 */
+  function submitAdd(andPlay) {
+    var tab = document.querySelector("#add-mask .tab.on").dataset.tab;
+    if (tab === "discover" && $("discover-form").style.display === "none") {
+      setAddMsg("请先扫描并选择一台设备");
+      return;
+    }
+    var c = validateAndCollect(tab);
+    if (!c) { return; }
+    var d = makeDevice(c);
+    devices.push(d);
+    renderDevices();
+    log("OK", "已添加设备「" + d.name + "」（" + d.host + "），配置写回 config.toml");
+    $("add-mask").classList.remove("show");
+    if (andPlay) {
+      state.selected = devices.length - 1;
+      renderDevices();
+      connect();
+      toast("已添加并开始播放", d.name + " · " + d.host);
+    } else {
+      toast("设备已保存", d.name + " · 未发起连接，当前播放不受影响");
+    }
+  }
+  $("add-save").addEventListener("click", function () { submitAdd(false); });
+  $("add-save-play").addEventListener("click", function () { submitAdd(true); });
+  $("add-cancel").addEventListener("click", function () { $("add-mask").classList.remove("show"); });
+  $("add-close").addEventListener("click", function () { $("add-mask").classList.remove("show"); });
+
+  /* ---------- 编辑设备 ---------- */
+  var editIdx = -1, editSnap = null;
+
+  function editConnDirty() {
+    return $("edit-onvif").value.trim() !== editSnap.onvif ||
+           $("edit-main").value.trim() !== editSnap.main ||
+           $("edit-sub").value.trim() !== editSnap.sub ||
+           $("edit-user").value !== editSnap.user ||
+           $("edit-pass").value !== editSnap.pass;
+  }
+
+  function updateEditBtn() {
+    var connDirty = editConnDirty();
+    var isCur = editIdx === state.selected;
+    var active = state.conn !== "idle" && state.conn !== "failed";
+    var btn = $("edit-save");
+    if (connDirty && isCur && active) {
+      btn.textContent = "保存并重连";
+      btn.title = "连接参数变化，保存后将断开并重连当前设备";
+    } else {
+      btn.textContent = "保存";
+      btn.title = "";
+    }
+  }
+  ["edit-name", "edit-onvif", "edit-main", "edit-sub", "edit-user", "edit-pass"].forEach(function (id) {
+    $(id).addEventListener("input", updateEditBtn);
+  });
+  $("edit-pw-toggle").addEventListener("click", function () {
+    var inp = $("edit-pass");
+    var show = inp.type === "password";
+    inp.type = show ? "text" : "password";
+    this.textContent = show ? "隐藏" : "显示";
+  });
+
+  function openEdit(i) {
+    editIdx = i;
+    var d = devices[i];
+    editSnap = { name: d.name, onvif: d.onvif || "", main: d.main || "", sub: d.sub || "",
+                 user: d.user || "", pass: d.pass || "" };
+    $("edit-name").value = d.name;
+    $("edit-id").value = d.id;
+    $("edit-onvif").value = d.onvif || "";
+    $("edit-main").value = d.main || "";
+    $("edit-sub").value = d.sub || "";
+    $("edit-user").value = d.user || "";
+    $("edit-pass").value = d.pass || "";
+    $("edit-pass").type = "password";
+    $("edit-pw-toggle").textContent = "显示";
+    $("edit-msg").textContent = "";
+    updateEditBtn();
+    $("edit-mask").classList.add("show");
+  }
+
+  $("edit-save").addEventListener("click", function () {
+    var d = devices[editIdx];
+    var name = $("edit-name").value.trim();
+    var onvif = $("edit-onvif").value.trim();
+    var main = $("edit-main").value.trim();
+    if (onvif && !/^http:\/\//i.test(onvif)) { $("edit-msg").textContent = "ONVIF 地址需以 http:// 开头"; return; }
+    if (main && !/^rtsp:\/\//i.test(main)) { $("edit-msg").textContent = "主流地址需以 rtsp:// 开头"; return; }
+    var reconnect = this.textContent === "保存并重连";
+    d.name = name || hostnameOf(d);
+    d.onvif = onvif; d.main = main; d.sub = $("edit-sub").value.trim();
+    d.user = $("edit-user").value; d.pass = $("edit-pass").value;
+    $("edit-mask").classList.remove("show");
+    renderDevices();
+    if (reconnect) {
+      log("OK", "「" + d.name + "」连接参数已更新，正在重连…");
+      toast("配置已保存，重连中", d.name);
+      connect();
+    } else {
+      log("OK", "「" + d.name + "」配置已保存（不打断当前播放，下次播放生效）");
+      toast("配置已保存", d.name + " · 仅重命名/非当前设备不重连");
+    }
+  });
+  $("edit-cancel").addEventListener("click", function () { $("edit-mask").classList.remove("show"); });
+  $("edit-close").addEventListener("click", function () { $("edit-mask").classList.remove("show"); });
+
+  /* ---------- 删除设备 ---------- */
+  var delIdx = -1;
+
+  function openDelete(i) {
+    delIdx = i;
+    var d = devices[i];
+    $("del-text").textContent = "将移除设备「" + d.name + "」（" + d.host + "）的配置。";
+    var imp = $("del-impact");
+    var lines = [];
+    if (i === state.selected) {
+      if (state.rec) { lines.push("· 正在进行的录像将停止并封口"); }
+      if (state.cacheOn) { lines.push("· 滚动缓存将停止写入"); }
+      lines.push("· 当前画面将清空，不会自动播放其他设备");
+    }
+    if (lines.length) {
+      imp.innerHTML = lines.map(function (l) { return "<div>" + l + "</div>"; }).join("");
+      imp.classList.add("show");
+    } else {
+      imp.classList.remove("show");
+    }
+    $("del-mask").classList.add("show");
+  }
+
+  $("del-ok").addEventListener("click", function () {
+    var d = devices[delIdx];
+    var wasCur = delIdx === state.selected;
+    if (wasCur) { disconnect(true); }
+    devices.splice(delIdx, 1);
+    if (wasCur) {
+      state.selected = -1; // 删除当前设备：清空画面，不自动播放其他设备
+    } else if (delIdx < state.selected) {
+      state.selected--;    // 删除前面的条目：保持当前设备归属
+    }
+    $("del-mask").classList.remove("show");
+    renderDevices();
+    updateConnUI();
+    log("OK", "已删除设备「" + d.name + "」的配置（录像、截图与缓存文件保留）。");
+    toast("设备已删除", d.name + " · 媒体文件保留");
+  });
+  $("del-cancel").addEventListener("click", function () { $("del-mask").classList.remove("show"); });
+  $("del-close").addEventListener("click", function () { $("del-mask").classList.remove("show"); });
+
+  ["add-mask", "edit-mask", "del-mask"].forEach(function (id) {
+    $(id).addEventListener("click", function (e) { if (e.target === this) { this.classList.remove("show"); } });
+  });
+
+  /* ---------- 杂项 ---------- */
+  $("btn-disconnect").addEventListener("click", function () { disconnect(false); });
+  $("btn-pause").addEventListener("click", function () {
+    if (state.conn === "live") {
+      state.conn = "paused";
+      log("INFO", "已暂停渲染，连接保持（单击设备不重连）。");
+      updateConnUI();
+      renderDevices();
+    } else if (state.conn === "paused") {
+      state.conn = "live";
+      log("OK", "已恢复播放。");
+      updateConnUI();
+      renderDevices();
+    }
+  });
+  $("btn-clear-log").addEventListener("click", function () { $("log-body").innerHTML = ""; log("INFO", "日志已清空。"); });
+
+  /* ---------- 心跳：时钟 + 统计 ---------- */
+  setInterval(function () {
+    var t = nowStr();
+    $("clock").textContent = t;
+    $("ov-time").textContent = t;
+  }, 1000);
+
+  var baseFps = 20;
+  setInterval(function () {
+    if (state.conn === "paused") { return; } // 暂停时冻结统计
+    if (state.conn !== "live") {
+      $("st-fps").innerHTML = "—<small>fps</small>";
+      $("st-res").textContent = "—";
+      $("st-mbps").innerHTML = "—<small>MB/s</small>";
+      $("st-frames").textContent = "—";
+      $("st-uptime").textContent = "运行 —";
+      $("ov-stats").textContent = "— × — · — fps";
+      $("ov-latency").textContent = "延迟 — ms";
+      return;
+    }
+    var fps = (state.high ? baseFps : 15) + (Math.random() * 0.8 - 0.4);
+    var w = state.high ? 1280 : 640, h = state.high ? 720 : 360;
+    var mb = w * h * 4 * fps / 1048576;
+    state.frames += Math.round(fps);
+    var up = Math.round((Date.now() - state.liveSince) / 1000);
+    var upStr = up < 60 ? up + "s" : Math.floor(up / 60) + "m" + pad(up % 60) + "s";
+    $("st-fps").innerHTML = fps.toFixed(1) + "<small>fps</small>";
+    $("st-res").textContent = w + "×" + h;
+    $("st-mbps").innerHTML = mb.toFixed(0) + "<small>MB/s</small>";
+    $("st-frames").textContent = state.frames.toLocaleString();
+    $("st-uptime").textContent = "运行 " + upStr;
+    $("ov-stats").textContent = w + "×" + h + " · H.264 · " + fps.toFixed(1) + " fps";
+    $("ov-latency").textContent = "延迟 " + (110 + Math.round(Math.random() * 40)) + " ms · TCP";
+  }, 1000);
+
+  /* ---------- 主题切换（夜间 / 日间皮肤） ---------- */
+  var THEME_KEY = "xdview-theme";
+  function currentThemeLight() { return document.body.classList.contains("light"); }
+  function setTheme(light, silent) {
+    document.body.classList.toggle("light", light);
+    try { localStorage.setItem(THEME_KEY, light ? "light" : "dark"); } catch (e) { /* file:// 下可能被禁，忽略 */ }
+    if (!silent) { log("INFO", light ? "主题 → 日间模式（浅色皮肤）" : "主题 → 夜间模式（深色皮肤）"); }
+  }
+  try {
+    if (localStorage.getItem(THEME_KEY) === "light") { document.body.classList.add("light"); }
+  } catch (e) { /* 忽略 */ }
+  $("theme-btn").addEventListener("click", function () {
+    setTheme(!currentThemeLight(), false);
+  });
+
+  /* ---------- 专注模式 ---------- */
+  var focusIdleTimer = null;
+  function setFocus(on) {
+    document.body.classList.toggle("focus", on);
+    if (on) {
+      log("INFO", "进入专注模式：只保留视频画面");
+      armFocusIdle();
+    } else {
+      clearTimeout(focusIdleTimer);
+      $("focus-exit").classList.remove("idle");
+      log("INFO", "已退出专注模式。");
+    }
+  }
+  function armFocusIdle() {
+    var btn = $("focus-exit");
+    btn.classList.remove("idle");
+    clearTimeout(focusIdleTimer);
+    focusIdleTimer = setTimeout(function () { btn.classList.add("idle"); }, 4000);
+  }
+  document.addEventListener("mousemove", function () {
+    if (document.body.classList.contains("focus")) { armFocusIdle(); }
+  });
+  $("focus-btn").addEventListener("click", function () { setFocus(true); });
+  $("focus-exit").addEventListener("click", function () { setFocus(false); });
+  document.addEventListener("keydown", function (e) {
+    if (e.key === "Escape" && document.body.classList.contains("focus")) { setFocus(false); }
+  });
+
+  /* ---------- 启动 ---------- */
+  renderDevices();
+  log("INFO", "xdview 启动 · 中文字体：Microsoft YaHei UI");
+  log("INFO", "读取 config.toml：3 路摄像机，autostart=第一路");
+  connect();
+
+})();
+</script>
+</body>
+</html>

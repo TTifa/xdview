@@ -535,6 +535,77 @@ mod tests {
     }
 
     #[test]
+    fn delayed_socket_feedback_from_first_a_is_stale_after_a_b_a_and_delete() {
+        use std::io::{Read, Write};
+        use std::net::TcpListener;
+        use std::sync::mpsc;
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let address = listener.local_addr().unwrap();
+        let (arrived_tx, arrived_rx) = mpsc::channel();
+        let (release_tx, release_rx) = mpsc::channel();
+        let server = thread::spawn(move || {
+            let (mut socket, _) = listener.accept().unwrap();
+            socket
+                .set_read_timeout(Some(Duration::from_secs(3)))
+                .unwrap();
+            let mut request = Vec::new();
+            let mut buf = [0; 1024];
+            loop {
+                let n = socket.read(&mut buf).unwrap();
+                assert_ne!(n, 0);
+                request.extend_from_slice(&buf[..n]);
+                if let Some(end) = request.windows(4).position(|w| w == b"\r\n\r\n") {
+                    let header = String::from_utf8_lossy(&request[..end]);
+                    let length = header
+                        .lines()
+                        .find_map(|line| {
+                            let (key, value) = line.split_once(':')?;
+                            key.eq_ignore_ascii_case("content-length")
+                                .then(|| value.trim().parse::<usize>().ok())
+                                .flatten()
+                        })
+                        .unwrap();
+                    if request.len() >= end + 4 + length {
+                        break;
+                    }
+                }
+            }
+            arrived_tx.send(()).unwrap();
+            release_rx.recv_timeout(Duration::from_secs(3)).unwrap();
+            drop(listener);
+            socket
+                .write_all(b"HTTP/1.1 500 Error\r\nContent-Length: 0\r\nConnection: close\r\n\r\n")
+                .unwrap();
+            socket.shutdown(std::net::Shutdown::Write).unwrap();
+        });
+        let mut link = ControlLink::new();
+        let first = link.revoke("a");
+        link.send(Command::Connect {
+            session: first.clone(),
+            base: format!("http://{address}"),
+            credentials: None,
+            resolve_stream: true,
+        });
+        arrived_rx.recv_timeout(Duration::from_secs(3)).unwrap();
+        let _b = link.revoke("b");
+        let current = link.revoke("a");
+        release_tx.send(()).unwrap();
+        let deadline = std::time::Instant::now() + Duration::from_secs(5);
+        let feedback = loop {
+            if let Some(feedback) = link.try_recv() {
+                break feedback;
+            }
+            assert!(std::time::Instant::now() < deadline, "未收到本地桩回执");
+            thread::sleep(Duration::from_millis(10));
+        };
+        assert_eq!(feedback.session(), Some(&first));
+        assert_ne!(feedback.session(), Some(&current));
+        let deleted = link.revoke("");
+        assert_ne!(feedback.session(), Some(&deleted));
+        server.join().unwrap();
+    }
+
+    #[test]
     fn session_differs_by_camera() {
         let link = ControlLink::new();
         assert_ne!(link.session("cam-a"), link.session("cam-b"));
